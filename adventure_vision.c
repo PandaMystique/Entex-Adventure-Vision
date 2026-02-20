@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  ENTEX ADVENTURE VISION EMULATOR v13 — ACCURACY IMPROVEMENTS
+ *  ENTEX ADVENTURE VISION EMULATOR v14 — ACCURACY IMPROVEMENTS
  * ============================================================================
  *
  *  Hardware (Dan Boris tech specs / MEGA research):
@@ -14,7 +14,18 @@
  *    - Buttons via P1.3-P1.7 (active-LOW, matrix encoded)
  *    - Sound: COP411L @ ~54.4 kHz (217.77 kHz RC / 4), commands via P2
  *
- *  v13 improvements:
+ *  v14 improvements (over v13):
+ *    - Rewind: hold F8 to step back up to 8 seconds (120 frames ring buffer)
+ *    - Audio low-pass filter simulating physical speaker characteristics
+ *    - WAV recording toggle (F2)
+ *    - Screenshot to BMP (F12)
+ *    - Drag & drop ROM loading from OS file manager
+ *    - Config file (advision.ini) for persistent preferences
+ *    - Command line: --fullscreen --scale N --volume N --no-sound
+ *    - Portable: MSVC-compatible strcasestr fallback
+ *    - Per-game control hints in menu info panel
+ *
+ *  v13 features:
  *    - Full COP411L behavioral sound emulation with LFSR noise, pitch
  *      slides, multi-segment volume, and all 13 documented sound effects
  *    - Column-by-column display rendering synchronized with mirror rotation
@@ -30,13 +41,34 @@
  *    Without args: scans current dir for ROMs and shows game selector.
  */
 
-#define _GNU_SOURCE  /* strcasestr */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
+#include <time.h>
+
+/* Portable strcasestr for MSVC and other non-GNU systems */
+#if defined(_MSC_VER) || !defined(__GLIBC__)
+static char *strcasestr(const char *haystack, const char *needle) {
+    if (!*needle) return (char*)haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) { h++; n++; }
+        if (!*n) return (char*)haystack;
+    }
+    return NULL;
+}
+#endif
+
+#ifdef _MSC_VER
+#define strcasecmp _stricmp
+#endif
 
 #ifdef USE_SDL
 #include <SDL2/SDL.h>
@@ -73,6 +105,12 @@
 #define AUDIO_RATE      44100
 #define AUDIO_SAMPLES   512
 #define MAX_BP          16
+
+/* Rewind buffer: stores snapshots of CPU+RAM state */
+#define REWIND_FRAMES   120   /* 8 seconds at 15fps */
+
+/* Audio low-pass filter coefficient (RC filter @ ~4kHz cutoff) */
+#define LP_ALPHA        0.45f
 
 /* T1 sensor pulse: narrow LOW pulse at start of mirror revolution */
 #define T1_PULSE_START  200    /* cycles into frame when T1 goes LOW */
@@ -822,6 +860,29 @@ static float disp_px(const AVDisp *d, int x, int y) {
  *  SYSTEM
  * ========================================================================== */
 
+/* Rewind snapshot: CPU core + RAM (compact, ~1.2KB per frame) */
+typedef struct {
+    uint8_t  A, PSW, SP, P1, P2, BUS, timer;
+    uint16_t PC;
+    uint8_t  flags;   /* MB,C,AC,F0,F1,BS,timer_en,counter_en */
+    uint8_t  flags2;  /* timer_ovf,tcnti_en,irq_en,irq_pend,in_irq */
+    int      tpre;
+    uint8_t  iram[IRAM_SZ];
+    uint8_t  xram[XRAM_SZ];
+    float    phosphor[SW * SH];
+    /* COP411L essential state */
+    uint8_t  snd_ctrl_loop, snd_ctrl_vol, snd_ctrl_fast;
+    uint8_t  snd_proto_state, snd_proto_hi;
+    uint16_t snd_lfsr;
+} RewindSnap;
+
+/* WAV file writer state */
+typedef struct {
+    FILE *fp;
+    uint32_t samples_written;
+    bool active;
+} WavWriter;
+
 struct AV {
     I8048   cpu;
     AVDisp  disp;
@@ -838,6 +899,17 @@ struct AV {
     /* OSD (on-screen display) */
     char osd_text[64];
     int  osd_timer;
+    /* Rewind ring buffer */
+    RewindSnap *rewind_buf;  /* heap-allocated [REWIND_FRAMES] */
+    int  rewind_head;        /* next write position */
+    int  rewind_count;       /* number of valid snapshots */
+    /* WAV recording */
+    WavWriter wav;
+    /* Audio low-pass filter state */
+    float lp_prev;
+    /* Config */
+    int  cfg_scale;          /* window scale factor (0=auto) */
+    bool cfg_no_sound;
 };
 
 static void av_port_write(AV *av, uint8_t port, uint8_t val) {
@@ -921,6 +993,11 @@ static void av_init(AV *av) {
     memset(av->cpu.xram + 0x100, 0xFF, 0x300);
     cop411_init(&av->snd);
     snprintf(av->save_name, sizeof(av->save_name), "advision.sav");
+    /* Rewind buffer: allocate on first init, reuse afterwards */
+    if (!av->rewind_buf)
+        av->rewind_buf = (RewindSnap *)calloc(REWIND_FRAMES, sizeof(RewindSnap));
+    av->rewind_head = 0;
+    av->rewind_count = 0;
 }
 
 static void av_reset(AV *av) {
@@ -965,6 +1042,131 @@ static void av_reset(AV *av) {
 static void osd_show(AV *av, const char *msg) {
     snprintf(av->osd_text, sizeof(av->osd_text), "%s", msg);
     av->osd_timer = FPS * 2;
+}
+
+/* ---- Rewind ---- */
+static void rewind_push(AV *av) {
+    if (!av->rewind_buf) return;
+    RewindSnap *s = &av->rewind_buf[av->rewind_head];
+    s->A = av->cpu.A; s->PC = av->cpu.PC; s->PSW = av->cpu.PSW;
+    s->SP = av->cpu.SP; s->P1 = av->cpu.P1; s->P2 = av->cpu.P2;
+    s->BUS = av->cpu.BUS; s->timer = av->cpu.timer; s->tpre = av->cpu.tpre;
+    s->flags = (av->cpu.MB)|(av->cpu.C<<1)|(av->cpu.AC<<2)|
+              (av->cpu.F0<<3)|(av->cpu.F1<<4)|(av->cpu.BS<<5)|
+              (av->cpu.timer_en<<6)|(av->cpu.counter_en<<7);
+    s->flags2 = (av->cpu.timer_ovf)|(av->cpu.tcnti_en<<1)|
+               (av->cpu.irq_en<<2)|(av->cpu.irq_pend<<3)|(av->cpu.in_irq<<4);
+    memcpy(s->iram, av->cpu.iram, IRAM_SZ);
+    memcpy(s->xram, av->cpu.xram, XRAM_SZ);
+    memcpy(s->phosphor, av->disp.phosphor, sizeof(av->disp.phosphor));
+    s->snd_ctrl_loop = av->snd.ctrl_loop; s->snd_ctrl_vol = av->snd.ctrl_vol;
+    s->snd_ctrl_fast = av->snd.ctrl_fast; s->snd_proto_state = av->snd.proto_state;
+    s->snd_proto_hi = av->snd.proto_hi; s->snd_lfsr = av->snd.lfsr;
+    av->rewind_head = (av->rewind_head + 1) % REWIND_FRAMES;
+    if (av->rewind_count < REWIND_FRAMES) av->rewind_count++;
+}
+
+static bool rewind_pop(AV *av) {
+    if (!av->rewind_buf || av->rewind_count <= 0) return false;
+    av->rewind_head = (av->rewind_head - 1 + REWIND_FRAMES) % REWIND_FRAMES;
+    av->rewind_count--;
+    RewindSnap *s = &av->rewind_buf[av->rewind_head];
+    av->cpu.A = s->A; av->cpu.PC = s->PC; av->cpu.PSW = s->PSW;
+    av->cpu.SP = s->SP; av->cpu.P1 = s->P1; av->cpu.P2 = s->P2;
+    av->cpu.BUS = s->BUS; av->cpu.timer = s->timer; av->cpu.tpre = s->tpre;
+    av->cpu.MB=s->flags&1; av->cpu.C=(s->flags>>1)&1; av->cpu.AC=(s->flags>>2)&1;
+    av->cpu.F0=(s->flags>>3)&1; av->cpu.F1=(s->flags>>4)&1; av->cpu.BS=(s->flags>>5)&1;
+    av->cpu.timer_en=(s->flags>>6)&1; av->cpu.counter_en=(s->flags>>7)&1;
+    av->cpu.timer_ovf=s->flags2&1; av->cpu.tcnti_en=(s->flags2>>1)&1;
+    av->cpu.irq_en=(s->flags2>>2)&1; av->cpu.irq_pend=(s->flags2>>3)&1;
+    av->cpu.in_irq=(s->flags2>>4)&1;
+    memcpy(av->cpu.iram, s->iram, IRAM_SZ);
+    memcpy(av->cpu.xram, s->xram, XRAM_SZ);
+    memcpy(av->disp.phosphor, s->phosphor, sizeof(av->disp.phosphor));
+    av->snd.ctrl_loop = s->snd_ctrl_loop; av->snd.ctrl_vol = s->snd_ctrl_vol;
+    av->snd.ctrl_fast = s->snd_ctrl_fast; av->snd.proto_state = s->snd_proto_state;
+    av->snd.proto_hi = s->snd_proto_hi; av->snd.lfsr = s->snd_lfsr;
+    av->snd.active = false;
+    return true;
+}
+
+/* ---- WAV recording ---- */
+static void wav_start(WavWriter *w, const char *fn) {
+    w->fp = fopen(fn, "wb");
+    if (!w->fp) return;
+    /* Write placeholder header (44 bytes), update on close */
+    uint8_t hdr[44] = {0};
+    memcpy(hdr, "RIFF", 4); memcpy(hdr+8, "WAVEfmt ", 8);
+    uint32_t v;
+    v = 16; memcpy(hdr+16, &v, 4);      /* chunk size */
+    uint16_t fmt = 1; memcpy(hdr+20, &fmt, 2); /* PCM */
+    fmt = 1; memcpy(hdr+22, &fmt, 2);   /* mono */
+    v = AUDIO_RATE; memcpy(hdr+24, &v, 4); /* sample rate */
+    v = AUDIO_RATE * 2; memcpy(hdr+28, &v, 4); /* byte rate */
+    fmt = 2; memcpy(hdr+32, &fmt, 2);   /* block align */
+    fmt = 16; memcpy(hdr+34, &fmt, 2);  /* bits/sample */
+    memcpy(hdr+36, "data", 4);
+    fwrite(hdr, 44, 1, w->fp);
+    w->samples_written = 0;
+    w->active = true;
+}
+
+static void wav_stop(WavWriter *w) {
+    if (!w->fp) return;
+    uint32_t data_sz = w->samples_written * 2;
+    uint32_t riff_sz = data_sz + 36;
+    fseek(w->fp, 4, SEEK_SET); fwrite(&riff_sz, 4, 1, w->fp);
+    fseek(w->fp, 40, SEEK_SET); fwrite(&data_sz, 4, 1, w->fp);
+    fclose(w->fp);
+    w->fp = NULL; w->active = false;
+}
+
+/* ---- Screenshot (BMP) ---- */
+#ifdef USE_SDL
+static void screenshot_bmp(SDL_Renderer *rr) {
+    int w, h;
+    SDL_GetRendererOutputSize(rr, &w, &h);
+    SDL_Surface *surf = SDL_CreateRGBSurface(0, w, h, 32,
+        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+    if (!surf) return;
+    SDL_RenderReadPixels(rr, NULL, SDL_PIXELFORMAT_ARGB8888, surf->pixels, surf->pitch);
+    /* Generate timestamped filename */
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char fn[128];
+    snprintf(fn, sizeof(fn), "advision_%04d%02d%02d_%02d%02d%02d.bmp",
+        t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+    SDL_SaveBMP(surf, fn);
+    SDL_FreeSurface(surf);
+    printf("Screenshot: %s\n", fn);
+}
+#endif
+
+/* ---- Config file (advision.ini) ---- */
+static void config_save(const AV *av, bool fullscreen) {
+    FILE *f = fopen("advision.ini", "w");
+    if (!f) return;
+    fprintf(f, "[advision]\n");
+    fprintf(f, "volume=%d\n", av->snd_volume);
+    fprintf(f, "fullscreen=%d\n", fullscreen ? 1 : 0);
+    fprintf(f, "scale=%d\n", av->cfg_scale);
+    fclose(f);
+}
+
+static void config_load(AV *av, bool *fullscreen) {
+    FILE *f = fopen("advision.ini", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "volume=%d", &v) == 1 && v >= 0 && v <= 10)
+            av->snd_volume = v;
+        if (sscanf(line, "fullscreen=%d", &v) == 1)
+            *fullscreen = (v != 0);
+        if (sscanf(line, "scale=%d", &v) == 1 && v >= 0 && v <= 10)
+            av->cfg_scale = v;
+    }
+    fclose(f);
 }
 
 static bool load_file(uint8_t *dest, int max_sz, const char *fn) {
@@ -1032,11 +1234,13 @@ static void av_run_frame(AV *av) {
     /* Update display from captured columns */
     disp_update(&av->disp);
     av->frame_count++;
+    /* Push rewind snapshot every frame */
+    rewind_push(av);
 }
 
 /* ---- Save/Load with validation ---- */
 #define SAVE_MAGIC  0x41563133  /* "AV13" */
-#define SAVE_VER    15
+#define SAVE_VER    16
 
 static bool save_state(const AV *av, const char *fn) {
     FILE *f = fopen(fn, "wb");
@@ -1388,6 +1592,7 @@ typedef struct {
     const char *developer;
     const char *genre;
     const char *desc[5];    /* description lines (NULL-terminated) */
+    const char *controls;   /* per-game control hint */
 } GameInfo;
 
 static const GameInfo game_db[] = {
@@ -1397,7 +1602,8 @@ static const GameInfo game_db[] = {
         "arcade game. Protect humanoids",
         "from waves of alien abductors",
         "across a scrolling landscape.",
-        NULL }
+        NULL },
+      "Z:fire X:thrust A:smart bomb"
     },
     { "Super Cobra", "1982", "Entex / Konami",
       "Horizontal shoot'em up",
@@ -1405,7 +1611,8 @@ static const GameInfo game_db[] = {
         "territory, dodging missiles and",
         "obstacles. Destroy fuel tanks",
         "to keep flying. 10 stages.",
-        NULL }
+        NULL },
+      "Z:fire X:bomb"
     },
     { "Space Force", "1982", "Entex",
       "Fixed-screen shooter",
@@ -1413,7 +1620,8 @@ static const GameInfo game_db[] = {
         "your base against descending",
         "waves of alien invaders in",
         "this fast-paced space shooter.",
-        NULL }
+        NULL },
+      "Z:fire"
     },
     { "Turtles", "1982", "Entex / Stern / Konami",
       "Maze / rescue",
@@ -1421,16 +1629,18 @@ static const GameInfo game_db[] = {
         "maze back to their home while",
         "avoiding beetles. Port of the",
         "Stern arcade original.",
-        NULL }
+        NULL },
+      "Arrows:move Z:mystery box"
     },
     { "Table Tennis", "1982", "Entex",
       "Sports / Pong",
       { "Classic table tennis / Pong",
         "gameplay on the Adventure",
         "Vision's unique LED display.",
-        NULL, NULL }
+        NULL, NULL },
+      "Up/Down:paddle Z:serve"
     },
-    { NULL, NULL, NULL, NULL, {NULL,NULL,NULL,NULL,NULL} }
+    { NULL, NULL, NULL, NULL, {NULL,NULL,NULL,NULL,NULL}, NULL }
 };
 
 static const GameInfo *find_game_info(const char *name) {
@@ -1881,7 +2091,7 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
             int tw = text_width(title, 2);
             draw_text(rr, (MENU_LW - tw) / 2, 8, title, 2, 200, 50, 20);
         }
-        draw_text(rr, 20, 30, "Entex 1982 Emulator v13", 1, 100, 70, 55);
+        draw_text(rr, 20, 30, "Entex 1982 Emulator v14", 1, 100, 70, 55);
 
         SDL_SetRenderDrawColor(rr, 60, 15, 10, 255);
         { SDL_Rect r = { 20, 44, MENU_LW - 40, 1 }; SDL_RenderFillRect(rr, &r); }
@@ -1963,6 +2173,11 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
                 draw_text(rr, TEXT_X, iy, "No info available", 1, 80, 60, 50);
             }
 
+            if (gi && gi->controls) {
+                iy += 4;
+                draw_text(rr, TEXT_X, iy, gi->controls, 1, 90, 140, 90);
+            }
+
             int by = COVER_Y + COVER_H + 10;
             draw_text(rr, COVER_X, by, "150x40 LED  |  Intel 8048", 1, 60, 42, 35);
             draw_text(rr, COVER_X, by + 11, "COP411L Sound  |  15 fps", 1, 60, 42, 35);
@@ -1971,7 +2186,7 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
         SDL_SetRenderDrawColor(rr, 20, 8, 6, 255);
         { SDL_Rect r = { 0, MENU_LH - 20, MENU_LW, 20 }; SDL_RenderFillRect(rr, &r); }
         draw_text(rr, 14, MENU_LH - 15,
-            "Up/Down/Click: select   Enter/Dbl-Click: play   Esc: quit", 1, 80, 60, 48);
+            "Up/Down/Click:select  Enter/DblClick:play  Esc:quit  F12:screenshot", 1, 80, 60, 48);
 
         /* ---- Blit render target to screen with letterboxing ---- */
         SDL_SetRenderTarget(rr, NULL);
@@ -2016,10 +2231,20 @@ static void audio_cb(void *ud, uint8_t *stream, int len) {
     int n = len / (int)sizeof(int16_t);
     int vol = av->snd_volume;
     int amplitude = 300 * vol;  /* max 3000 at vol=10 */
+    float prev = av->lp_prev;
     for (int i = 0; i < n; i++) {
         float s = cop411_sample(&av->snd);
-        out[i] = (int16_t)(s * (float)amplitude);
+        /* Single-pole low-pass filter simulating speaker rolloff */
+        prev += LP_ALPHA * (s - prev);
+        int16_t sample = (int16_t)(prev * (float)amplitude);
+        out[i] = sample;
+        /* Write to WAV if recording */
+        if (av->wav.active && av->wav.fp) {
+            fwrite(&sample, sizeof(int16_t), 1, av->wav.fp);
+            av->wav.samples_written++;
+        }
     }
+    av->lp_prev = prev;
 }
 
 /* ---- Render: faithful red LED POV display ----
@@ -2119,13 +2344,53 @@ int main(int argc, char **argv) {
     AV av;
     av_init(&av);
 
+    /* Parse command line arguments */
+    bool opt_fullscreen = false;
+    bool opt_no_sound = false;
+    int opt_scale = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--fullscreen") == 0) opt_fullscreen = true;
+        else if (strcmp(argv[i], "--no-sound") == 0) opt_no_sound = true;
+        else if (strcmp(argv[i], "--scale") == 0 && i+1 < argc) {
+            opt_scale = atoi(argv[++i]);
+            if (opt_scale < 1 || opt_scale > 10) opt_scale = 0;
+        }
+        else if (strcmp(argv[i], "--volume") == 0 && i+1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v >= 0 && v <= 10) av.snd_volume = v;
+        }
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Adventure Vision Emulator v14\n\n"
+                   "Usage: %s [options] [bios.rom game.rom]\n\n"
+                   "Options:\n"
+                   "  --fullscreen    Start in fullscreen\n"
+                   "  --scale N       Window scale factor (1-10)\n"
+                   "  --volume N      Initial volume (0-10, default 7)\n"
+                   "  --no-sound      Disable audio\n"
+                   "  -h, --help      Show this help\n", argv[0]);
+            return 0;
+        }
+    }
+
+    /* Load config (overridden by command line) */
+    bool cfg_fs = false;
+    config_load(&av, &cfg_fs);
+    if (opt_fullscreen) cfg_fs = true;
+    if (opt_scale) av.cfg_scale = opt_scale;
+    av.cfg_no_sound = opt_no_sound;
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
 
+    int init_w = 900, init_h = 540;
+    if (av.cfg_scale > 0) {
+        init_w = SW * av.cfg_scale;
+        init_h = SH * av.cfg_scale;
+    }
     SDL_Window *win = SDL_CreateWindow("Adventure Vision",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 900, 540,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, init_w, init_h,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -2147,8 +2412,11 @@ int main(int argc, char **argv) {
     want.freq = AUDIO_RATE; want.format = AUDIO_S16SYS;
     want.channels = 1; want.samples = AUDIO_SAMPLES;
     want.callback = audio_cb; want.userdata = &av;
-    SDL_AudioDeviceID adev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (adev) SDL_PauseAudioDevice(adev, 0);
+    SDL_AudioDeviceID adev = 0;
+    if (!av.cfg_no_sound) {
+        adev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (adev) SDL_PauseAudioDevice(adev, 0);
+    }
     av.adev = (uint32_t)adev; /* Store for thread-safe audio locking in av_port_write */
 
     /* Gamepad */
@@ -2156,8 +2424,18 @@ int main(int argc, char **argv) {
     for (int i = 0; i < SDL_NumJoysticks(); i++)
         if (SDL_IsGameController(i)) { gp = SDL_GameControllerOpen(i); break; }
 
-    bool fullscreen = false;
-    bool direct_mode = (argc >= 3);
+    bool fullscreen = cfg_fs;
+    if (fullscreen)
+        SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+
+    /* Determine direct mode: exactly 2 non-option args = bios + game */
+    int pos_args = 0;
+    char *pos_argv[2] = {NULL, NULL};
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' && pos_args < 2) pos_argv[pos_args++] = argv[i];
+        else if (strncmp(argv[i], "--scale", 7) == 0 || strncmp(argv[i], "--volume", 8) == 0) i++;
+    }
+    bool direct_mode = (pos_args >= 2);
 
     /* ===== OUTER LOOP: menu → game → menu ===== */
     while (1) {
@@ -2167,10 +2445,10 @@ int main(int argc, char **argv) {
         av.adev = saved_adev;
 
         if (direct_mode) {
-            if (!load_file(av.cpu.irom, IROM_SZ, argv[1])) break;
-            if (!load_file(av.cpu.erom, EROM_SZ, argv[2])) break;
-            const char *slash = strrchr(argv[2], '/');
-            const char *gn = prettify_name(slash ? slash+1 : argv[2]);
+            if (!load_file(av.cpu.irom, IROM_SZ, pos_argv[0])) break;
+            if (!load_file(av.cpu.erom, EROM_SZ, pos_argv[1])) break;
+            const char *slash = strrchr(pos_argv[1], '/');
+            const char *gn = prettify_name(slash ? slash+1 : pos_argv[1]);
             snprintf(game_title, sizeof(game_title), "Adventure Vision - %.200s", gn);
             make_save_name(av.save_name, sizeof(av.save_name), gn);
         } else {
@@ -2280,6 +2558,24 @@ int main(int argc, char **argv) {
                                printf("[DBG] %s\n",av.dbg.active?"ON":"OFF");
                                if(av.dbg.active)dbg_print(&av.cpu); }
                         break;
+                    case SDLK_F2:
+                        if(p) {
+                            if (av.wav.active) {
+                                wav_stop(&av.wav);
+                                osd_show(&av, "WAV saved");
+                            } else {
+                                time_t now = time(NULL);
+                                struct tm *t = localtime(&now);
+                                char wfn[128];
+                                snprintf(wfn, sizeof(wfn), "advision_%04d%02d%02d_%02d%02d%02d.wav",
+                                    t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+                                if (adev) SDL_LockAudioDevice(adev);
+                                wav_start(&av.wav, wfn);
+                                if (adev) SDL_UnlockAudioDevice(adev);
+                                osd_show(&av, av.wav.active ? "Recording WAV..." : "WAV failed");
+                            }
+                        }
+                        break;
                     case SDLK_F5:
                         if(p) {
                             if(save_state(&av, av.save_name)) osd_show(&av, "State saved");
@@ -2290,6 +2586,18 @@ int main(int argc, char **argv) {
                         if(p) {
                             if(load_state(&av, av.save_name)) osd_show(&av, "State loaded");
                             else osd_show(&av, "No save found");
+                        }
+                        break;
+                    case SDLK_F8:
+                        if(p) {
+                            /* Rewind: pop multiple frames for visible effect */
+                            int rw = 0;
+                            for (int ri = 0; ri < 4; ri++)
+                                if (rewind_pop(&av)) rw++;
+                            if (rw > 0) {
+                                char rb[32]; snprintf(rb, 32, "Rewind -%d", rw);
+                                osd_show(&av, rb);
+                            } else osd_show(&av, "No rewind data");
                         }
                         break;
                     case SDLK_F9:
@@ -2306,6 +2614,9 @@ int main(int argc, char **argv) {
                                 fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                         }
                         break;
+                    case SDLK_F12:
+                        if(p) { screenshot_bmp(rr); osd_show(&av, "Screenshot saved"); }
+                        break;
                     default: break;
                     } break;
                 }
@@ -2317,6 +2628,25 @@ int main(int argc, char **argv) {
                             fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                     }
                     break;
+                case SDL_DROPFILE: {
+                    /* Drag & drop: load ROM file into game slot */
+                    char *drop = e.drop.file;
+                    if (drop) {
+                        long dsz = 0;
+                        FILE *df = fopen(drop, "rb");
+                        if (df) { fseek(df, 0, SEEK_END); dsz = ftell(df); fclose(df); }
+                        if (dsz == 1024) {
+                            load_file(av.cpu.irom, IROM_SZ, drop);
+                            osd_show(&av, "BIOS loaded");
+                        } else if (dsz >= 512 && dsz <= 8192) {
+                            load_file(av.cpu.erom, EROM_SZ, drop);
+                            av_reset(&av);
+                            osd_show(&av, "ROM loaded & reset");
+                        }
+                        SDL_free(drop);
+                    }
+                    break;
+                }
                 case SDL_CONTROLLERBUTTONDOWN: case SDL_CONTROLLERBUTTONUP: {
                     bool p = (e.type == SDL_CONTROLLERBUTTONDOWN);
                     switch(e.cbutton.button){
@@ -2390,6 +2720,15 @@ int main(int argc, char **argv) {
         if (!av.running || direct_mode) break;
         SDL_SetWindowTitle(win, "Adventure Vision");
     }
+
+    /* Save config on clean exit */
+    config_save(&av, fullscreen);
+
+    /* Stop WAV recording if active */
+    if (av.wav.active) wav_stop(&av.wav);
+
+    /* Free rewind buffer */
+    if (av.rewind_buf) { free(av.rewind_buf); av.rewind_buf = NULL; }
 
     if(adev) SDL_CloseAudioDevice(adev);
     if(gp) SDL_GameControllerClose(gp);
