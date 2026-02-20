@@ -23,6 +23,8 @@
  *
  *  Build:
  *    gcc -O2 -DUSE_SDL -o advision adventure_vision.c -lSDL2 -lm
+ *  With embedded ROMs + cover art:
+ *    gcc -O2 -DUSE_SDL -DEMBED_ROMS -DEMBED_COVERS -o advision adventure_vision.c -lSDL2 -lm
  *  Usage:
  *    ./advision [bios.rom game.rom]
  *    Without args: scans current dir for ROMs and shows game selector.
@@ -44,6 +46,10 @@
 #include "embedded_roms.h"
 #endif
 
+#ifdef EMBED_COVERS
+#include "cover_art.h"
+#endif
+
 /* ---- Configuration ---- */
 #define CPU_CLK         737280
 #define FPS             15
@@ -54,6 +60,10 @@
 #define LED_SIZE        4       /* lit portion of each SCALE×SCALE cell */
 #define WIN_W           (SW * SCALE)
 #define WIN_H           (SH * SCALE)
+
+/* Menu logical dimensions (larger than game for info panel) */
+#define MENU_LW         700
+#define MENU_LH         460
 
 #define IRAM_SZ         64
 #define XRAM_SZ         1024      /* 4 banks × 256 */
@@ -1371,6 +1381,239 @@ static const struct { const char *pat; const char *title; } known_games[] = {
     {NULL,NULL}
 };
 
+/* ---- Game info database for the info panel ---- */
+typedef struct {
+    const char *name;       /* matches prettified game name */
+    const char *year;
+    const char *developer;
+    const char *genre;
+    const char *desc[5];    /* description lines (NULL-terminated) */
+} GameInfo;
+
+static const GameInfo game_db[] = {
+    { "Defender", "1982", "Entex / Williams",
+      "Horizontal shoot'em up",
+      { "Port of the classic Williams",
+        "arcade game. Protect humanoids",
+        "from waves of alien abductors",
+        "across a scrolling landscape.",
+        NULL }
+    },
+    { "Super Cobra", "1982", "Entex / Konami",
+      "Horizontal shoot'em up",
+      { "Fly a helicopter through enemy",
+        "territory, dodging missiles and",
+        "obstacles. Destroy fuel tanks",
+        "to keep flying. 10 stages.",
+        NULL }
+    },
+    { "Space Force", "1982", "Entex",
+      "Fixed-screen shooter",
+      { "Original Entex title. Defend",
+        "your base against descending",
+        "waves of alien invaders in",
+        "this fast-paced space shooter.",
+        NULL }
+    },
+    { "Turtles", "1982", "Entex / Stern / Konami",
+      "Maze / rescue",
+      { "Guide baby turtles through a",
+        "maze back to their home while",
+        "avoiding beetles. Port of the",
+        "Stern arcade original.",
+        NULL }
+    },
+    { "Table Tennis", "1982", "Entex",
+      "Sports / Pong",
+      { "Classic table tennis / Pong",
+        "gameplay on the Adventure",
+        "Vision's unique LED display.",
+        NULL, NULL }
+    },
+    { NULL, NULL, NULL, NULL, {NULL,NULL,NULL,NULL,NULL} }
+};
+
+static const GameInfo *find_game_info(const char *name) {
+    for (int i = 0; game_db[i].name; i++) {
+        if (strcasestr(name, game_db[i].name))
+            return &game_db[i];
+    }
+    return NULL;
+}
+
+/* ---- Procedural cover art for known games ---- */
+static void draw_cover_defender(SDL_Renderer *rr, int x, int y, int w, int h) {
+    /* Starfield */
+    SDL_SetRenderDrawColor(rr, 4, 2, 8, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    SDL_SetRenderDrawColor(rr, 100, 80, 60, 255);
+    for (int i = 0; i < 20; i++) {
+        int sx = x + (i * 37 + 13) % w;
+        int sy = y + (i * 23 + 7) % (h - 30);
+        SDL_Rect st = {sx, sy, 1, 1};
+        SDL_RenderFillRect(rr, &st);
+    }
+    /* Terrain */
+    SDL_SetRenderDrawColor(rr, 100, 45, 15, 255);
+    int th = h / 5;
+    for (int tx = 0; tx < w; tx++) {
+        int ty = th + (int)(6.0f * sinf((float)tx * 0.08f) + 3.0f * sinf((float)tx * 0.2f));
+        SDL_Rect t = {x + tx, y + h - ty, 1, ty};
+        SDL_RenderFillRect(rr, &t);
+    }
+    /* Ship */
+    int sx = x + w / 3, sy = y + h / 2 - 5;
+    SDL_SetRenderDrawColor(rr, 220, 60, 20, 255);
+    SDL_Rect sh1 = {sx, sy + 2, 14, 4};
+    SDL_Rect sh2 = {sx + 14, sy + 3, 4, 2};
+    SDL_Rect sh3 = {sx - 2, sy, 4, 8};
+    SDL_RenderFillRect(rr, &sh1);
+    SDL_RenderFillRect(rr, &sh2);
+    SDL_RenderFillRect(rr, &sh3);
+    /* Title */
+    draw_text(rr, x + (w - text_width("DEFENDER", 1)) / 2, y + 4, "DEFENDER", 1, 200, 50, 20);
+}
+
+static void draw_cover_cobra(SDL_Renderer *rr, int x, int y, int w, int h) {
+    SDL_SetRenderDrawColor(rr, 4, 6, 4, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    /* Mountains */
+    for (int tx = 0; tx < w; tx++) {
+        float m = 20.0f * sinf((float)tx * 0.04f) + 10.0f * sinf((float)tx * 0.11f + 1.0f);
+        int mh = (int)m + h / 3;
+        if (mh < 5) mh = 5;
+        SDL_SetRenderDrawColor(rr, 50, 70, 35, 255);
+        SDL_Rect mt = {x + tx, y + h - mh, 1, mh};
+        SDL_RenderFillRect(rr, &mt);
+    }
+    /* Helicopter body */
+    int hx = x + w / 3, hy = y + h / 3;
+    SDL_SetRenderDrawColor(rr, 200, 55, 20, 255);
+    SDL_Rect b1 = {hx, hy, 12, 6};
+    SDL_Rect b2 = {hx + 12, hy + 1, 4, 4};
+    SDL_Rect b3 = {hx - 6, hy + 2, 6, 2};  /* tail */
+    SDL_Rect b4 = {hx + 2, hy - 2, 10, 1}; /* rotor */
+    SDL_RenderFillRect(rr, &b1);
+    SDL_RenderFillRect(rr, &b2);
+    SDL_RenderFillRect(rr, &b3);
+    SDL_RenderFillRect(rr, &b4);
+    /* Fuel tanks */
+    SDL_SetRenderDrawColor(rr, 160, 130, 30, 255);
+    for (int i = 0; i < 3; i++) {
+        SDL_Rect ft = {x + w/2 + i*30, y + h - 18, 6, 8};
+        SDL_RenderFillRect(rr, &ft);
+    }
+    draw_text(rr, x + (w - text_width("SUPER COBRA", 1)) / 2, y + 4, "SUPER COBRA", 1, 200, 50, 20);
+}
+
+static void draw_cover_space(SDL_Renderer *rr, int x, int y, int w, int h) {
+    SDL_SetRenderDrawColor(rr, 2, 2, 10, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    /* Stars */
+    SDL_SetRenderDrawColor(rr, 120, 100, 80, 255);
+    for (int i = 0; i < 30; i++) {
+        SDL_Rect st = {x + (i*41+5) % w, y + (i*29+3) % h, 1, 1};
+        SDL_RenderFillRect(rr, &st);
+    }
+    /* Enemy formation */
+    SDL_SetRenderDrawColor(rr, 180, 50, 20, 255);
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 5; col++) {
+            SDL_Rect en = {x + w/4 + col*20, y + 20 + row*14, 8, 6};
+            SDL_RenderFillRect(rr, &en);
+        }
+    /* Player */
+    SDL_SetRenderDrawColor(rr, 220, 70, 25, 255);
+    int px = x + w / 2 - 4;
+    SDL_Rect p1 = {px, y + h - 20, 8, 6};
+    SDL_Rect p2 = {px + 3, y + h - 24, 2, 4};
+    SDL_RenderFillRect(rr, &p1);
+    SDL_RenderFillRect(rr, &p2);
+    draw_text(rr, x + (w - text_width("SPACE FORCE", 1)) / 2, y + 4, "SPACE FORCE", 1, 200, 50, 20);
+}
+
+static void draw_cover_turtles(SDL_Renderer *rr, int x, int y, int w, int h) {
+    SDL_SetRenderDrawColor(rr, 4, 4, 2, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    /* Maze grid */
+    SDL_SetRenderDrawColor(rr, 80, 50, 25, 255);
+    for (int gx = 0; gx < 6; gx++) {
+        SDL_Rect vl = {x + 15 + gx * 25, y + 18, 1, h - 36};
+        SDL_RenderFillRect(rr, &vl);
+    }
+    for (int gy = 0; gy < 5; gy++) {
+        SDL_Rect hl = {x + 15, y + 18 + gy * 20, w - 30, 1};
+        SDL_RenderFillRect(rr, &hl);
+    }
+    /* Turtles */
+    SDL_SetRenderDrawColor(rr, 50, 180, 50, 255);
+    int tx[] = {30, 80, 55};
+    int ty[] = {40, 60, 80};
+    for (int i = 0; i < 3; i++) {
+        SDL_Rect tb = {x + tx[i], y + ty[i], 6, 5};
+        SDL_RenderFillRect(rr, &tb);
+    }
+    /* Beetle */
+    SDL_SetRenderDrawColor(rr, 180, 40, 20, 255);
+    SDL_Rect bt = {x + 100, y + 50, 5, 5};
+    SDL_RenderFillRect(rr, &bt);
+    draw_text(rr, x + (w - text_width("TURTLES", 1)) / 2, y + 4, "TURTLES", 1, 200, 50, 20);
+}
+
+static void draw_cover_tennis(SDL_Renderer *rr, int x, int y, int w, int h) {
+    SDL_SetRenderDrawColor(rr, 4, 4, 4, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    /* Net */
+    SDL_SetRenderDrawColor(rr, 60, 40, 25, 255);
+    for (int ny = 0; ny < h - 20; ny += 4) {
+        SDL_Rect n = {x + w/2, y + 10 + ny, 1, 2};
+        SDL_RenderFillRect(rr, &n);
+    }
+    /* Paddles */
+    SDL_SetRenderDrawColor(rr, 200, 55, 20, 255);
+    SDL_Rect p1 = {x + 15, y + h/2 - 10, 4, 20};
+    SDL_Rect p2 = {x + w - 19, y + h/2 - 8, 4, 20};
+    SDL_RenderFillRect(rr, &p1);
+    SDL_RenderFillRect(rr, &p2);
+    /* Ball */
+    SDL_SetRenderDrawColor(rr, 220, 180, 40, 255);
+    SDL_Rect ball = {x + w/2 + 15, y + h/2 - 2, 4, 4};
+    SDL_RenderFillRect(rr, &ball);
+    draw_text(rr, x + (w - text_width("TABLE TENNIS", 1)) / 2, y + 4, "TABLE TENNIS", 1, 200, 50, 20);
+}
+
+static void draw_cover_generic(SDL_Renderer *rr, int x, int y, int w, int h, const char *name) {
+    SDL_SetRenderDrawColor(rr, 8, 4, 4, 255);
+    SDL_Rect bg = {x, y, w, h};
+    SDL_RenderFillRect(rr, &bg);
+    /* AV logo outline */
+    SDL_SetRenderDrawColor(rr, 80, 30, 15, 255);
+    SDL_Rect brd = {x + 4, y + 4, w - 8, h - 8};
+    SDL_RenderDrawRect(rr, &brd);
+    /* Game name centered */
+    int tw = text_width(name, 1);
+    if (tw > w - 10) tw = w - 10;
+    draw_text(rr, x + (w - tw) / 2, y + h / 2 - 4, name, 1, 160, 60, 30);
+}
+
+static void draw_cover(SDL_Renderer *rr, int x, int y, int w, int h, const char *name) {
+    if (strcasestr(name, "Defender"))         draw_cover_defender(rr, x, y, w, h);
+    else if (strcasestr(name, "Super Cobra")) draw_cover_cobra(rr, x, y, w, h);
+    else if (strcasestr(name, "Space Force")) draw_cover_space(rr, x, y, w, h);
+    else if (strcasestr(name, "Turtles"))     draw_cover_turtles(rr, x, y, w, h);
+    else if (strcasestr(name, "Table Tennis"))draw_cover_tennis(rr, x, y, w, h);
+    else                                      draw_cover_generic(rr, x, y, w, h, name);
+    /* Border */
+    SDL_SetRenderDrawColor(rr, 100, 40, 20, 255);
+    SDL_Rect brd = {x, y, w, h};
+    SDL_RenderDrawRect(rr, &brd);
+}
+
 static const char *prettify_name(const char *filename) {
     static char buf[128];
     for (int i = 0; known_games[i].pat; i++)
@@ -1453,13 +1696,134 @@ static void menu_scan(GameMenu *m, const char *dir) {
             m->game_count++;
         }
     }
+
+    /* Sort games alphabetically (simple bubble sort, max 16 games) */
+    for (int i = 0; i < m->game_count - 1; i++) {
+        for (int j = i + 1; j < m->game_count; j++) {
+            if (strcasecmp(m->game_names[i], m->game_names[j]) > 0) {
+                char tmp_path[PATH_MAX_LEN], tmp_name[128];
+                int tmp_idx;
+                memcpy(tmp_path, m->game_paths[i], PATH_MAX_LEN);
+                memcpy(tmp_name, m->game_names[i], 128);
+                tmp_idx = m->game_embed_idx[i];
+                memcpy(m->game_paths[i], m->game_paths[j], PATH_MAX_LEN);
+                memcpy(m->game_names[i], m->game_names[j], 128);
+                m->game_embed_idx[i] = m->game_embed_idx[j];
+                memcpy(m->game_paths[j], tmp_path, PATH_MAX_LEN);
+                memcpy(m->game_names[j], tmp_name, 128);
+                m->game_embed_idx[j] = tmp_idx;
+            }
+        }
+    }
 }
 
-static int menu_run(GameMenu *m, SDL_Renderer *rr) {
+/* ---- Cover texture from embedded pixel data ---- */
+#ifdef EMBED_COVERS
+typedef struct { const char *name; const uint32_t *data; } CoverEntry;
+static const CoverEntry cover_entries[] = {
+    { "Defender",     cover_defender },
+    { "Super Cobra",  cover_super_cobra },
+    { "Space Force",  cover_space_force },
+    { "Turtles",      cover_turtles },
+    { NULL, NULL }
+};
+
+static SDL_Texture *create_cover_texture(SDL_Renderer *rr, const uint32_t *argb) {
+    /* Enable bilinear filtering for this texture */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+    SDL_Texture *tex = SDL_CreateTexture(rr, SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STATIC, COVER_THUMB_W, COVER_THUMB_H);
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0"); /* restore nearest for pixel art */
+    if (!tex) return NULL;
+    SDL_UpdateTexture(tex, NULL, argb, COVER_THUMB_W * sizeof(uint32_t));
+    return tex;
+}
+
+static const uint32_t *find_cover_data(const char *name) {
+    for (int i = 0; cover_entries[i].name; i++)
+        if (strcasestr(name, cover_entries[i].name))
+            return cover_entries[i].data;
+    return NULL;
+}
+#endif
+
+
+
+
+
+static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
+    const int LIST_X = 20, LIST_W = 300;
+    const int LIST_Y0 = 68, LIST_ROW_H = 18;
+    const int PANEL_X = 340;
+    const int COVER_X = PANEL_X + 8, COVER_Y = 56;
+    const int COVER_W = 126, COVER_H = 180;
+    const int TEXT_X  = COVER_X + COVER_W + 14;
+
+    Uint32 last_click_time = 0;
+    int last_click_idx = -1;
+
+#ifdef EMBED_COVERS
+    SDL_Texture *cover_tex[MAX_GAMES];
+    memset(cover_tex, 0, sizeof(cover_tex));
+    for (int i = 0; i < m->game_count; i++) {
+        const uint32_t *data = find_cover_data(m->game_names[i]);
+        if (data) cover_tex[i] = create_cover_texture(rr, data);
+    }
+#endif
+
+    SDL_RenderSetLogicalSize(rr, 0, 0);
+
+    /* Render target at full output resolution — recreated on resize.
+     * Bilinear filtering so scaling to screen looks smooth. */
+    int rt_ow = 0, rt_oh = 0;
+    SDL_Texture *rt = NULL;
+
     while (1) {
+        /* Check output size, (re)create render target if needed */
+        int ow, oh;
+        SDL_GetRendererOutputSize(rr, &ow, &oh);
+        if (ow < 1) ow = 1;
+        if (oh < 1) oh = 1;
+        if (ow != rt_ow || oh != rt_oh) {
+            if (rt) SDL_DestroyTexture(rt);
+            SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+            rt = SDL_CreateTexture(rr, SDL_PIXELFORMAT_ARGB8888,
+                SDL_TEXTUREACCESS_TARGET, ow, oh);
+            SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+            rt_ow = ow;
+            rt_oh = oh;
+        }
+
+        /* Compute scale to fit MENU_LW×MENU_LH into the output */
+        float osx = (float)ow / (float)MENU_LW;
+        float osy = (float)oh / (float)MENU_LH;
+        float osc = (osx < osy) ? osx : osy;
+
+        /* Window-space letterbox rect (mouse events live here) */
+        int ww, wh;
+        SDL_GetWindowSize(win, &ww, &wh);
+        if (ww < 1) ww = 1;
+        if (wh < 1) wh = 1;
+        float wsx = (float)ww / (float)MENU_LW;
+        float wsy = (float)wh / (float)MENU_LH;
+        float wsc = (wsx < wsy) ? wsx : wsy;
+        int dw = (int)((float)MENU_LW * wsc);
+        int dh = (int)((float)MENU_LH * wsc);
+        int dx = (ww - dw) / 2;
+        int dy = (wh - dh) / 2;
+
+        /* Output-space blit destination (may differ from window on HiDPI) */
+        float dpix = (float)ow / (float)ww;
+        float dpiy = (float)oh / (float)wh;
+        SDL_Rect blit_dst = {
+            (int)((float)dx * dpix), (int)((float)dy * dpiy),
+            (int)((float)dw * dpix), (int)((float)dh * dpiy)
+        };
+
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) return -1;
+            if (e.type == SDL_QUIT) goto menu_exit_quit;
+
             if (e.type == SDL_KEYDOWN) {
                 switch (e.key.keysym.sym) {
                 case SDLK_UP:
@@ -1471,75 +1835,178 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr) {
                         m->selected = (m->selected + 1) % m->game_count;
                     break;
                 case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_z:
-                    if (m->has_bios && m->game_count > 0)
-                        return m->selected;
+                    if (m->has_bios && m->game_count > 0) goto menu_exit_play;
                     break;
-                case SDLK_ESCAPE:
-                    return -1;
+                case SDLK_ESCAPE: goto menu_exit_quit;
                 default: break;
                 }
             }
+
+            /* Mouse: window coords → logical via window-space letterbox.
+             * Both mouse events and dx/dy/dw/dh are in window pixel space. */
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                int mx = (dw > 0) ? (e.button.x - dx) * MENU_LW / dw : 0;
+                int my = (dh > 0) ? (e.button.y - dy) * MENU_LH / dh : 0;
+
+                if (mx >= LIST_X - 5 && mx < LIST_X + LIST_W + 5 &&
+                    my >= LIST_Y0 && m->game_count > 0) {
+                    int idx = (my - LIST_Y0) / LIST_ROW_H;
+                    if (idx >= 0 && idx < m->game_count) {
+                        Uint32 now = SDL_GetTicks();
+                        if (idx == last_click_idx && (now - last_click_time) < 500) {
+                            if (m->has_bios) { m->selected = idx; goto menu_exit_play; }
+                        }
+                        m->selected = idx;
+                        last_click_idx = idx;
+                        last_click_time = now;
+                    }
+                }
+            }
         }
+
+        /* ---- Draw into high-res render target ---- */
+        SDL_SetRenderTarget(rr, rt);
+        SDL_RenderSetViewport(rr, NULL);
+        SDL_RenderSetScale(rr, osc, osc);
 
         SDL_SetRenderDrawColor(rr, 10, 4, 4, 255);
         SDL_RenderClear(rr);
 
+        /* Top accent */
         SDL_SetRenderDrawColor(rr, 160, 35, 15, 255);
-        SDL_Rect topbar = { 0, 0, WIN_W, 2 };
-        SDL_RenderFillRect(rr, &topbar);
+        { SDL_Rect r = { 0, 0, MENU_LW, 2 }; SDL_RenderFillRect(rr, &r); }
 
         {
             const char *title = "ADVENTURE VISION";
             int tw = text_width(title, 2);
-            draw_text(rr, (WIN_W - tw) / 2, 10, title, 2, 200, 50, 20);
+            draw_text(rr, (MENU_LW - tw) / 2, 8, title, 2, 200, 50, 20);
         }
         draw_text(rr, 20, 30, "Entex 1982 Emulator v13", 1, 100, 70, 55);
 
         SDL_SetRenderDrawColor(rr, 60, 15, 10, 255);
-        SDL_Rect sep = { 20, 42, WIN_W - 40, 1 };
-        SDL_RenderFillRect(rr, &sep);
+        { SDL_Rect r = { 20, 44, MENU_LW - 40, 1 }; SDL_RenderFillRect(rr, &r); }
 
         int ypos = 50;
         if (!m->has_bios) {
-            draw_text(rr, 20, ypos, "! BIOS not found", 1, 255, 90, 70);
-            ypos += 12;
-            draw_text(rr, 20, ypos, "  Place 1KB BIOS ROM in this folder", 1, 180, 120, 100);
-            ypos += 16;
+            draw_text(rr, LIST_X, ypos, "! BIOS not found", 1, 255, 90, 70);
+            ypos += 10;
+            draw_text(rr, LIST_X, ypos, "  Place 1KB BIOS in this folder", 1, 150, 100, 80);
+            ypos += 14;
         }
         if (m->game_count == 0) {
-            draw_text(rr, 20, ypos, "! No game ROMs found", 1, 255, 90, 70);
-            ypos += 12;
-            draw_text(rr, 20, ypos, "  Place .bin/.rom game files here", 1, 180, 120, 100);
-            ypos += 16;
+            draw_text(rr, LIST_X, ypos, "! No game ROMs found", 1, 255, 90, 70);
+            ypos += 10;
+            draw_text(rr, LIST_X, ypos, "  Place .bin/.rom files here", 1, 150, 100, 80);
         }
 
         if (m->game_count > 0) {
-            if (m->has_bios)
-                draw_text(rr, 20, ypos, "Select game:", 1, 150, 130, 110);
-            ypos += 14;
+            draw_text(rr, LIST_X, 52, "Select game:", 1, 120, 100, 85);
 
             for (int i = 0; i < m->game_count; i++) {
-                int gy = ypos + i * 14;
-                if (gy + 12 > WIN_H - 18) break;
+                int gy = LIST_Y0 + i * LIST_ROW_H;
+                if (gy + 14 > MENU_LH - 25) break;
                 if (i == m->selected) {
-                    SDL_SetRenderDrawColor(rr, 40, 8, 6, 255);
-                    SDL_Rect bg = { 18, gy - 1, WIN_W - 36, 13 };
-                    SDL_RenderFillRect(rr, &bg);
-                    SDL_SetRenderDrawColor(rr, 200, 45, 15, 255);
-                    SDL_Rect mk = { 20, gy + 1, 2, 9 };
-                    SDL_RenderFillRect(rr, &mk);
-                    draw_text(rr, 28, gy, m->game_names[i], 1, 255, 230, 210);
+                    SDL_SetRenderDrawColor(rr, 40, 10, 8, 255);
+                    { SDL_Rect r = { LIST_X - 2, gy, LIST_W, LIST_ROW_H - 2 }; SDL_RenderFillRect(rr, &r); }
+                    SDL_SetRenderDrawColor(rr, 200, 50, 18, 255);
+                    { SDL_Rect r = { LIST_X, gy + 2, 2, 12 }; SDL_RenderFillRect(rr, &r); }
+                    draw_text(rr, LIST_X + 10, gy + 3, m->game_names[i], 1, 255, 230, 210);
                 } else {
-                    draw_text(rr, 28, gy, m->game_names[i], 1, 130, 95, 75);
+                    draw_text(rr, LIST_X + 10, gy + 3, m->game_names[i], 1, 130, 95, 75);
                 }
             }
         }
 
-        draw_text(rr, 20, WIN_H - 12, "Up/Down: select   Enter: play   Esc: quit", 1, 80, 60, 50);
+        SDL_SetRenderDrawColor(rr, 40, 15, 10, 255);
+        { SDL_Rect r = { PANEL_X - 10, 48, 1, MENU_LH - 75 }; SDL_RenderFillRect(rr, &r); }
 
+        if (m->game_count > 0 && m->selected >= 0 && m->selected < m->game_count) {
+            const char *gname = m->game_names[m->selected];
+
+            bool drew_photo = false;
+#ifdef EMBED_COVERS
+            if (m->selected < MAX_GAMES && cover_tex[m->selected]) {
+                SDL_Rect dst = { COVER_X, COVER_Y, COVER_W, COVER_H };
+                SDL_RenderCopy(rr, cover_tex[m->selected], NULL, &dst);
+                drew_photo = true;
+            }
+#endif
+            if (!drew_photo)
+                draw_cover(rr, COVER_X, COVER_Y, COVER_W, COVER_H, gname);
+
+            SDL_SetRenderDrawColor(rr, 80, 35, 18, 255);
+            { SDL_Rect r = {COVER_X-1, COVER_Y-1, COVER_W+2, COVER_H+2}; SDL_RenderDrawRect(rr, &r); }
+
+            const GameInfo *gi = find_game_info(gname);
+            int iy = COVER_Y + 2;
+            draw_text(rr, TEXT_X, iy, gname, 1, 220, 180, 150);
+            iy += 16;
+
+            if (gi) {
+                draw_text(rr, TEXT_X, iy, gi->year, 1, 130, 95, 70);
+                iy += 12;
+                draw_text(rr, TEXT_X, iy, gi->developer, 1, 120, 85, 65);
+                iy += 14;
+                SDL_SetRenderDrawColor(rr, 50, 18, 10, 255);
+                int gtw = text_width(gi->genre, 1);
+                { SDL_Rect r = {TEXT_X-2, iy-1, gtw+4, 11}; SDL_RenderFillRect(rr, &r); }
+                draw_text(rr, TEXT_X, iy, gi->genre, 1, 180, 70, 35);
+                iy += 18;
+                SDL_SetRenderDrawColor(rr, 45, 18, 10, 255);
+                { SDL_Rect r = {TEXT_X, iy, 180, 1}; SDL_RenderFillRect(rr, &r); }
+                iy += 8;
+                for (int d = 0; d < 5 && gi->desc[d]; d++) {
+                    draw_text(rr, TEXT_X, iy, gi->desc[d], 1, 105, 85, 70);
+                    iy += 11;
+                }
+            } else {
+                draw_text(rr, TEXT_X, iy, "No info available", 1, 80, 60, 50);
+            }
+
+            int by = COVER_Y + COVER_H + 10;
+            draw_text(rr, COVER_X, by, "150x40 LED  |  Intel 8048", 1, 60, 42, 35);
+            draw_text(rr, COVER_X, by + 11, "COP411L Sound  |  15 fps", 1, 60, 42, 35);
+        }
+
+        SDL_SetRenderDrawColor(rr, 20, 8, 6, 255);
+        { SDL_Rect r = { 0, MENU_LH - 20, MENU_LW, 20 }; SDL_RenderFillRect(rr, &r); }
+        draw_text(rr, 14, MENU_LH - 15,
+            "Up/Down/Click: select   Enter/Dbl-Click: play   Esc: quit", 1, 80, 60, 48);
+
+        /* ---- Blit render target to screen with letterboxing ---- */
+        SDL_SetRenderTarget(rr, NULL);
+        SDL_RenderSetScale(rr, 1.0f, 1.0f);
+        SDL_SetRenderDrawColor(rr, 6, 2, 2, 255);
+        SDL_RenderClear(rr);
+        SDL_RenderCopy(rr, rt, NULL, &blit_dst);
         SDL_RenderPresent(rr);
-        SDL_Delay(50);
+        SDL_Delay(30);
     }
+
+menu_exit_play:
+    {
+        int result = m->selected;
+#ifdef EMBED_COVERS
+        for (int i = 0; i < m->game_count; i++)
+            if (cover_tex[i]) SDL_DestroyTexture(cover_tex[i]);
+#endif
+        if (rt) SDL_DestroyTexture(rt);
+        SDL_RenderSetViewport(rr, NULL);
+        SDL_RenderSetScale(rr, 1.0f, 1.0f);
+        SDL_RenderSetLogicalSize(rr, WIN_W, WIN_H);
+        return result;
+    }
+
+menu_exit_quit:
+#ifdef EMBED_COVERS
+    for (int i = 0; i < m->game_count; i++)
+        if (cover_tex[i]) SDL_DestroyTexture(cover_tex[i]);
+#endif
+    if (rt) SDL_DestroyTexture(rt);
+    SDL_RenderSetViewport(rr, NULL);
+    SDL_RenderSetScale(rr, 1.0f, 1.0f);
+    SDL_RenderSetLogicalSize(rr, WIN_W, WIN_H);
+    return -1;
 }
 
 /* ---- Audio callback — generates samples from COP411L engine ---- */
@@ -1603,6 +2070,10 @@ static void render(SDL_Renderer *rr, AV *av) {
         }
     }
     SDL_UpdateTexture(tex, NULL, framebuf, WIN_W * sizeof(uint32_t));
+
+    /* Clear full window (wipes any menu remnants from letterbox areas) */
+    SDL_SetRenderDrawColor(rr, 0, 0, 0, 255);
+    SDL_RenderClear(rr);
     SDL_RenderCopy(rr, tex, NULL, NULL);
 
     /* OSD overlay */
@@ -1654,12 +2125,14 @@ int main(int argc, char **argv) {
     }
 
     SDL_Window *win = SDL_CreateWindow("Adventure Vision",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 900, 540,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         SDL_Quit(); return 1;
     }
+    /* Set minimum size so menu remains usable */
+    SDL_SetWindowMinimumSize(win, 640, 380);
 
     SDL_Renderer *rr = SDL_CreateRenderer(win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -1721,7 +2194,7 @@ int main(int argc, char **argv) {
             if (menu.game_count == 1 && menu.has_bios) {
                 sel = 0;
             } else {
-                sel = menu_run(&menu, rr);
+                sel = menu_run(&menu, rr, win);
                 if (sel < 0) break;
             }
 
@@ -1836,6 +2309,14 @@ int main(int argc, char **argv) {
                     default: break;
                     } break;
                 }
+                case SDL_MOUSEBUTTONDOWN:
+                    /* Double-click toggles borderless fullscreen */
+                    if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2) {
+                        fullscreen = !fullscreen;
+                        SDL_SetWindowFullscreen(win,
+                            fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    }
+                    break;
                 case SDL_CONTROLLERBUTTONDOWN: case SDL_CONTROLLERBUTTONUP: {
                     bool p = (e.type == SDL_CONTROLLERBUTTONDOWN);
                     switch(e.cbutton.button){
