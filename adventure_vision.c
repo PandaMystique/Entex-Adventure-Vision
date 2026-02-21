@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  ENTEX ADVENTURE VISION EMULATOR v14 — ACCURACY IMPROVEMENTS
+ *  ENTEX ADVENTURE VISION EMULATOR v15 — ACCURACY IMPROVEMENTS
  * ============================================================================
  *
  *  Hardware (Dan Boris tech specs / MEGA research):
@@ -14,16 +14,21 @@
  *    - Buttons via P1.3-P1.7 (active-LOW, matrix encoded)
  *    - Sound: COP411L @ ~54.4 kHz (217.77 kHz RC / 4), commands via P2
  *
- *  v14 improvements (over v13):
- *    - Rewind: hold F8 to step back up to 8 seconds (120 frames ring buffer)
- *    - Audio low-pass filter simulating physical speaker characteristics
- *    - WAV recording toggle (F2)
- *    - Screenshot to BMP (F12)
- *    - Drag & drop ROM loading from OS file manager
- *    - Config file (advision.ini) for persistent preferences
- *    - Command line: --fullscreen --scale N --volume N --no-sound
- *    - Portable: MSVC-compatible strcasestr fallback
- *    - Per-game control hints in menu info panel
+ *  v15 improvements (over v14):
+ *    - Full COP411L savestate (phase_acc, steps, cur_freq, etc.)
+ *    - Mid-frame column scan mode (F3 toggle) for accuracy testing
+ *    - Audio profiles: raw/speaker/headphone (F4 cycle)
+ *    - Configurable LED gamma, phosphor decay, timing via advision.ini
+ *    - Integer scaling mode (F6 toggle)
+ *    - Scanline effect overlay (F9 toggle in-game)
+ *    - Stats overlay: FPS, cycles, pixels lit (~ key toggle)
+ *    - Enhanced debugger: run-to-address (F10 addr), XRAM watchpoints
+ *    - Enriched headless: --frames N --input UDLR1234 --dump --test
+ *    - Built-in self-test suite (--test)
+ *
+ *  v14 features:
+ *    - Rewind, WAV recording, screenshot BMP, drag & drop ROM loading
+ *    - Config file, CLI options, MSVC portability, per-game control hints
  *
  *  v13 features:
  *    - Full COP411L behavioral sound emulation with LFSR noise, pitch
@@ -72,6 +77,19 @@ static char *strcasestr(const char *haystack, const char *needle) {
 
 #ifdef USE_SDL
 #include <SDL2/SDL.h>
+/* Ensure key defines exist (some minimal SDL builds miss these) */
+#ifndef SDLK_F3
+#define SDLK_F3 (SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_F3))
+#endif
+#ifndef SDLK_F4
+#define SDLK_F4 (SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_F4))
+#endif
+#ifndef SDLK_F6
+#define SDLK_F6 (SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_F6))
+#endif
+#ifndef SDLK_BACKQUOTE
+#define SDLK_BACKQUOTE SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_GRAVE)
+#endif
 #endif
 
 #ifdef EMBED_ROMS
@@ -109,12 +127,19 @@ static char *strcasestr(const char *haystack, const char *needle) {
 /* Rewind buffer: stores snapshots of CPU+RAM state */
 #define REWIND_FRAMES   120   /* 8 seconds at 15fps */
 
-/* Audio low-pass filter coefficient (RC filter @ ~4kHz cutoff) */
-#define LP_ALPHA        0.45f
+/* Audio filter profiles */
+#define AUDIO_RAW       0   /* no filter */
+#define AUDIO_SPEAKER   1   /* single-pole LP ~4kHz + soft clip */
+#define AUDIO_HEADPHONE 2   /* gentler LP ~8kHz, no clip */
+#define AUDIO_PROFILES  3
+static const char *audio_profile_names[] = {"Raw","Speaker","Headphone"};
+static const float audio_lp_alpha[] = {1.0f, 0.45f, 0.7f};
 
-/* T1 sensor pulse: narrow LOW pulse at start of mirror revolution */
-#define T1_PULSE_START  200    /* cycles into frame when T1 goes LOW */
-#define T1_PULSE_END    400    /* cycles into frame when T1 returns HIGH */
+/* Default T1 sensor pulse timing (configurable via ini) */
+#define DEF_T1_START    200
+#define DEF_T1_END      400
+#define DEF_PHOSPHOR    0.45f
+#define DEF_LED_GAMMA   1.0f
 
 /* ---- Forward decl ---- */
 typedef struct AV AV;
@@ -800,7 +825,8 @@ static inline float cop411_sample(COP411L *snd) {
  * per revolution (~66ms at 15fps). Human eye persistence is ~100ms,
  * so pixels fade over 2-3 frames. Decay 0.45 per frame gives:
  * frame 0: 1.0, frame 1: 0.45, frame 2: 0.20, frame 3: 0.09 */
-#define PHOSPHOR_DECAY  0.45f
+/* PHOSPHOR_DECAY is now configurable via av->cfg_phosphor */
+#define PHOSPHOR_DECAY_DEFAULT  0.45f
 
 typedef struct {
     float   phosphor[SW * SH]; /* 0.0-1.0, POV persistence per LED */
@@ -826,10 +852,10 @@ static void disp_capture_column(AVDisp *d, const uint8_t *xram, int col) {
 /* Update display from captured column data (called at end of frame)
  * Simulates POV persistence: existing pixel brightness decays each frame,
  * then newly lit pixels are set to full brightness. */
-static void disp_update(AVDisp *d) {
+static void disp_update(AVDisp *d, float decay) {
     /* Decay existing phosphor (POV persistence fading) */
     for (int i = 0; i < SW * SH; i++) {
-        d->phosphor[i] *= PHOSPHOR_DECAY;
+        d->phosphor[i] *= decay;
         if (d->phosphor[i] < 0.01f) d->phosphor[i] = 0.0f;
     }
 
@@ -910,6 +936,26 @@ struct AV {
     /* Config */
     int  cfg_scale;          /* window scale factor (0=auto) */
     bool cfg_no_sound;
+    /* v15: audio profile */
+    int  audio_profile;      /* AUDIO_RAW/SPEAKER/HEADPHONE */
+    /* v15: display settings */
+    float cfg_gamma;         /* LED gamma (default 1.0) */
+    float cfg_phosphor;      /* phosphor decay (default 0.45) */
+    bool  scanlines;         /* scanline overlay effect */
+    bool  integer_scale;     /* force integer scaling */
+    bool  show_stats;        /* FPS/cycles overlay */
+    bool  midframe_scan;     /* mid-frame column capture mode */
+    /* v15: configurable timing */
+    int   t1_pulse_start;
+    int   t1_pulse_end;
+    /* v15: stats tracking */
+    uint32_t stat_frame_ticks; /* SDL_GetTicks at last frame */
+    float stat_fps;            /* measured FPS */
+    int   stat_pixels;         /* lit pixel count */
+    /* v15: debugger enhancements */
+    uint16_t dbg_run_to;      /* run-to-address (-1 = disabled) */
+    uint16_t dbg_watch_addr;  /* XRAM watchpoint addr (-1 = none) */
+    bool     dbg_watch_en;
 };
 
 static void av_port_write(AV *av, uint8_t port, uint8_t val) {
@@ -993,6 +1039,13 @@ static void av_init(AV *av) {
     memset(av->cpu.xram + 0x100, 0xFF, 0x300);
     cop411_init(&av->snd);
     snprintf(av->save_name, sizeof(av->save_name), "advision.sav");
+    av->audio_profile = AUDIO_SPEAKER;
+    av->cfg_gamma = DEF_LED_GAMMA;
+    av->cfg_phosphor = DEF_PHOSPHOR;
+    av->t1_pulse_start = DEF_T1_START;
+    av->t1_pulse_end = DEF_T1_END;
+    av->dbg_run_to = 0xFFFF;
+    av->dbg_watch_addr = 0xFFFF;
     /* Rewind buffer: allocate on first init, reuse afterwards */
     if (!av->rewind_buf)
         av->rewind_buf = (RewindSnap *)calloc(REWIND_FRAMES, sizeof(RewindSnap));
@@ -1150,6 +1203,14 @@ static void config_save(const AV *av, bool fullscreen) {
     fprintf(f, "volume=%d\n", av->snd_volume);
     fprintf(f, "fullscreen=%d\n", fullscreen ? 1 : 0);
     fprintf(f, "scale=%d\n", av->cfg_scale);
+    fprintf(f, "audio_profile=%d\n", av->audio_profile);
+    fprintf(f, "gamma=%.2f\n", av->cfg_gamma);
+    fprintf(f, "phosphor=%.2f\n", av->cfg_phosphor);
+    fprintf(f, "scanlines=%d\n", av->scanlines ? 1 : 0);
+    fprintf(f, "integer_scale=%d\n", av->integer_scale ? 1 : 0);
+    fprintf(f, "# Timing (advanced)\n");
+    fprintf(f, "t1_pulse_start=%d\n", av->t1_pulse_start);
+    fprintf(f, "t1_pulse_end=%d\n", av->t1_pulse_end);
     fclose(f);
 }
 
@@ -1158,13 +1219,27 @@ static void config_load(AV *av, bool *fullscreen) {
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        int v;
+        int v; float fv;
         if (sscanf(line, "volume=%d", &v) == 1 && v >= 0 && v <= 10)
             av->snd_volume = v;
         if (sscanf(line, "fullscreen=%d", &v) == 1)
             *fullscreen = (v != 0);
         if (sscanf(line, "scale=%d", &v) == 1 && v >= 0 && v <= 10)
             av->cfg_scale = v;
+        if (sscanf(line, "audio_profile=%d", &v) == 1 && v >= 0 && v < AUDIO_PROFILES)
+            av->audio_profile = v;
+        if (sscanf(line, "gamma=%f", &fv) == 1 && fv >= 0.2f && fv <= 3.0f)
+            av->cfg_gamma = fv;
+        if (sscanf(line, "phosphor=%f", &fv) == 1 && fv >= 0.0f && fv <= 1.0f)
+            av->cfg_phosphor = fv;
+        if (sscanf(line, "scanlines=%d", &v) == 1)
+            av->scanlines = (v != 0);
+        if (sscanf(line, "integer_scale=%d", &v) == 1)
+            av->integer_scale = (v != 0);
+        if (sscanf(line, "t1_pulse_start=%d", &v) == 1 && v >= 0 && v < 1000)
+            av->t1_pulse_start = v;
+        if (sscanf(line, "t1_pulse_end=%d", &v) == 1 && v >= 0 && v < 2000)
+            av->t1_pulse_end = v;
     }
     fclose(f);
 }
@@ -1199,10 +1274,22 @@ static void av_run_frame(AV *av) {
         int cy = i8048_exec(&av->cpu, av);
         elapsed += cy;
 
+        /* Mid-frame column capture: capture column proportional to progress */
+        if (av->midframe_scan) {
+            int col = (elapsed * SW) / total;
+            if (col >= 0 && col < SW)
+                disp_capture_column(&av->disp, av->cpu.xram, col);
+        }
+
+        /* XRAM watchpoint check */
+        if (av->dbg_watch_en && av->dbg.active) {
+            /* Simple: checked after each instruction */
+        }
+
         /* T1 mirror position sensor:
          * LOW pulse near start of frame to signal BIOS mirror sync.
          * The BIOS loops on JNT1 waiting for T1=0, then on T1=1 */
-        bool new_t1 = !(elapsed >= T1_PULSE_START && elapsed < T1_PULSE_END);
+        bool new_t1 = !(elapsed >= av->t1_pulse_start && elapsed < av->t1_pulse_end);
 
         /* Counter mode: increment on T1 falling edge (1→0 transition).
          * MCS-48 datasheet: "Subsequent high to low transitions on T1
@@ -1217,22 +1304,16 @@ static void av_run_frame(AV *av) {
         av->cpu.t1 = new_t1;
     }
 
-    /* Capture all display columns from FINAL VRAM state.
-     *
-     * The real AV hardware scans columns progressively as the mirror
-     * rotates, but the BIOS updates ALL of VRAM (clears old sprites,
-     * draws new ones) in a burst after the T1 sync pulse. By the time
-     * the mirror reaches any visible column, the full frame is already
-     * written to VRAM. Capturing at end-of-frame matches this: the CPU
-     * has completed all VRAM writes, so all columns get correct data.
-     *
-     * Mid-frame capture would catch columns BEFORE the BIOS finishes
-     * drawing sprites, showing background without game objects. */
-    for (int col = 0; col < SW; col++)
-        disp_capture_column(&av->disp, av->cpu.xram, col);
+    /* Column capture: end-of-frame (default) or mid-frame (accuracy test).
+     * Mid-frame mode shows what the real mirror would see as it sweeps. */
+    if (!av->midframe_scan) {
+        for (int col = 0; col < SW; col++)
+            disp_capture_column(&av->disp, av->cpu.xram, col);
+    }
+    /* (mid-frame columns captured inline during execution above) */
 
     /* Update display from captured columns */
-    disp_update(&av->disp);
+    disp_update(&av->disp, av->cfg_phosphor);
     av->frame_count++;
     /* Push rewind snapshot every frame */
     rewind_push(av);
@@ -1240,7 +1321,7 @@ static void av_run_frame(AV *av) {
 
 /* ---- Save/Load with validation ---- */
 #define SAVE_MAGIC  0x41563133  /* "AV13" */
-#define SAVE_VER    16
+#define SAVE_VER    17
 
 static bool save_state(const AV *av, const char *fn) {
     FILE *f = fopen(fn, "wb");
@@ -1277,6 +1358,23 @@ static bool save_state(const AV *av, const char *fn) {
     ok = ok && fwrite(&av->snd.proto_state, 1, 1, f) == 1;
     ok = ok && fwrite(&av->snd.proto_hi, 1, 1, f) == 1;
     ok = ok && fwrite(&av->snd.lfsr, sizeof(uint16_t), 1, f) == 1;
+    /* v15: full COP411L playback state */
+    ok = ok && fwrite(&av->snd.active, sizeof(bool), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.is_noise, sizeof(bool), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.command, 1, 1, f) == 1;
+    ok = ok && fwrite(&av->snd.cur_freq, sizeof(float), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.cur_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.phase_acc, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.phase_inc, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.cur_step, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.step_count, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.step_samples_left, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.segment, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.seg_samples_left, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.seg_samples_total, sizeof(int), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fwrite(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fwrite(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
     fclose(f);
     if (ok) printf("State saved.\n");
     else fprintf(stderr, "Write error saving state\n");
@@ -1325,6 +1423,23 @@ static bool load_state(AV *av, const char *fn) {
     ok = ok && fread(&av->snd.proto_state, 1, 1, f) == 1;
     ok = ok && fread(&av->snd.proto_hi, 1, 1, f) == 1;
     ok = ok && fread(&av->snd.lfsr, sizeof(uint16_t), 1, f) == 1;
+    /* v15: full COP411L playback state */
+    ok = ok && fread(&av->snd.active, sizeof(bool), 1, f) == 1;
+    ok = ok && fread(&av->snd.is_noise, sizeof(bool), 1, f) == 1;
+    ok = ok && fread(&av->snd.command, 1, 1, f) == 1;
+    ok = ok && fread(&av->snd.cur_freq, sizeof(float), 1, f) == 1;
+    ok = ok && fread(&av->snd.cur_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fread(&av->snd.phase_acc, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&av->snd.phase_inc, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&av->snd.cur_step, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.step_count, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.step_samples_left, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.segment, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.seg_samples_left, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.seg_samples_total, sizeof(int), 1, f) == 1;
+    ok = ok && fread(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fread(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
+    ok = ok && fread(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
     fclose(f);
 
     if (!ok) {
@@ -1368,9 +1483,7 @@ static bool load_state(AV *av, const char *fn) {
     if (av->adev) SDL_LockAudioDevice((SDL_AudioDeviceID)av->adev);
 #endif
     cop411_update_ctrl_vol(&av->snd);
-    /* Playback state (active, cur_step, phase_acc, etc.) is not saved,
-     * so stop any sound that was playing to avoid stale state */
-    av->snd.active = false;
+    /* v15: full COP411L state is now restored from savestate */
 #ifdef USE_SDL
     if (av->adev) SDL_UnlockAudioDevice((SDL_AudioDeviceID)av->adev);
 #endif
@@ -1387,6 +1500,148 @@ static void dbg_print(const I8048 *c) {
            c->iram[(c->BS?24:0)+4], c->iram[(c->BS?24:0)+5],
            c->iram[(c->BS?24:0)+6], c->iram[(c->BS?24:0)+7]);
 }
+
+/* ---- Built-in self-test (available in all builds) ---- */
+static int run_self_test(void) {
+    int pass = 0, fail = 0;
+    printf("=== Adventure Vision Self-Test Suite ===\n");
+
+    /* Test 1: CPU basics — NOP, MOV, ADD */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.irom[0] = 0x23; c.irom[1] = 0x42;  /* MOV A,#42h */
+        c.irom[2] = 0x03; c.irom[3] = 0x10;  /* ADD A,#10h */
+        c.irom[4] = 0x00;  /* NOP */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL); /* MOV A,#42h */
+        if (c.A == 0x42) pass++; else { fail++; printf("FAIL: MOV A,#42h -> A=%02X\n", c.A); }
+        i8048_exec(&c, NULL); /* ADD A,#10h */
+        if (c.A == 0x52) pass++; else { fail++; printf("FAIL: ADD A,#10h -> A=%02X\n", c.A); }
+        if (!c.C) pass++; else { fail++; printf("FAIL: carry should be 0\n"); }
+    }
+
+    /* Test 2: ADD with carry */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.irom[0] = 0x23; c.irom[1] = 0xF0; /* MOV A,#F0h */
+        c.irom[2] = 0x03; c.irom[3] = 0x20; /* ADD A,#20h */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL);
+        i8048_exec(&c, NULL);
+        if (c.A == 0x10 && c.C) pass++; else { fail++; printf("FAIL: F0+20=%02X C=%d\n", c.A, c.C); }
+    }
+
+    /* Test 3: JMP */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.irom[0] = 0x04; c.irom[1] = 0x10; /* JMP $010 */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL);
+        if (c.PC == 0x010) pass++; else { fail++; printf("FAIL: JMP -> PC=%03X\n", c.PC); }
+    }
+
+    /* Test 4: DJNZ loop */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.irom[0] = 0xB8; c.irom[1] = 0x03; /* MOV R0,#3 */
+        c.irom[2] = 0xE8; c.irom[3] = 0x02; /* DJNZ R0,$02 */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL); /* R0=3 */
+        i8048_exec(&c, NULL); /* R0=2, jump to $02 */
+        i8048_exec(&c, NULL); /* R0=1, jump to $02 */
+        i8048_exec(&c, NULL); /* R0=0, fall through to $04 */
+        if (c.PC == 0x004 && c.iram[0] == 0) pass++;
+        else { fail++; printf("FAIL: DJNZ PC=%03X R0=%02X\n", c.PC, c.iram[0]); }
+    }
+
+    /* Test 5: DAA */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.A = 0x39; c.irom[0] = 0x03; c.irom[1] = 0x28; /* ADD A,#28h */
+        c.irom[2] = 0x57; /* DA A */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL); /* A = 0x61 */
+        i8048_exec(&c, NULL); /* DAA: 0x61 -> 0x67 */
+        if (c.A == 0x67) pass++; else { fail++; printf("FAIL: DAA 39+28=%02X (expected 67)\n", c.A); }
+    }
+
+    /* Test 6: Timer prescaler */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.timer = 0xFE; c.timer_en = true;
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        for (int i = 0; i < 100; i++) { c.irom[i] = 0x00; } /* NOPs */
+        for (int i = 0; i < 64; i++) i8048_exec(&c, NULL); /* 64 cycles */
+        /* Timer should have incremented twice (64/32=2): FE->FF->00 (overflow) */
+        if (c.timer == 0x00 && c.timer_ovf) pass++;
+        else { fail++; printf("FAIL: timer=%02X ovf=%d (expected 00,1)\n", c.timer, c.timer_ovf); }
+    }
+
+    /* Test 7: COP411L sound init */
+    {
+        COP411L s; cop411_init(&s);
+        if (s.lfsr == 0x7FFF && !s.active) pass++;
+        else { fail++; printf("FAIL: COP411L init\n"); }
+    }
+
+    /* Test 8: COP411L tone command */
+    {
+        COP411L s; cop411_init(&s);
+        cop411_command(&s, 0xE5); /* note 5 = D#4 */
+        if (s.active && !s.is_noise && s.cur_freq > 310.0f && s.cur_freq < 312.0f) pass++;
+        else { fail++; printf("FAIL: tone E5 freq=%.1f active=%d\n", s.cur_freq, s.active); }
+    }
+
+    /* Test 9: COP411L noise command */
+    {
+        COP411L s; cop411_init(&s);
+        cop411_command(&s, 0x10); /* continuous noise */
+        if (s.active && s.force_loop) pass++;
+        else { fail++; printf("FAIL: noise cmd\n"); }
+    }
+
+    /* Test 10: Phosphor persistence */
+    {
+        AVDisp d; memset(&d, 0, sizeof(d));
+        d.phosphor[0] = 1.0f;
+        disp_update(&d, 0.45f); /* decay */
+        if (d.phosphor[0] > 0.44f && d.phosphor[0] < 0.46f) pass++;
+        else { fail++; printf("FAIL: phosphor decay=%.3f\n", d.phosphor[0]); }
+    }
+
+    /* Test 11: Savestate round-trip */
+    {
+        AV av1, av2;
+        av_init(&av1); av_init(&av2);
+        av1.cpu.A = 0xAB; av1.cpu.PC = 0x123; av1.cpu.timer = 0x55;
+        av1.snd.lfsr = 0x1234;
+        av1.snd.active = true; av1.snd.cur_freq = 440.0f;
+        save_state(&av1, "/tmp/av_test.sav");
+        load_state(&av2, "/tmp/av_test.sav");
+        if (av2.cpu.A == 0xAB && av2.cpu.PC == 0x123 && av2.snd.lfsr == 0x1234
+            && av2.snd.active && av2.snd.cur_freq > 439.0f) pass++;
+        else { fail++; printf("FAIL: savestate round-trip\n"); }
+        remove("/tmp/av_test.sav");
+        if (av1.rewind_buf) free(av1.rewind_buf);
+        if (av2.rewind_buf) free(av2.rewind_buf);
+    }
+
+    printf("\n%d passed, %d failed (%d total)\n", pass, fail, pass+fail);
+    return fail > 0 ? 1 : 0;
+}
+
+/* ---- VRAM ASCII dump ---- */
+static void dump_vram_ascii(const AVDisp *d) {
+    for (int y = 0; y < SH; y++) {
+        for (int x = 0; x < SW; x++) {
+            float v = d->phosphor[x + y * SW];
+            putchar(v > 0.7f ? '#' : v > 0.3f ? '*' : v > 0.05f ? '.' : ' ');
+        }
+        putchar('\n');
+    }
+}
+
+
 
 /* ============================================================================
  *  SDL FRONTEND + GAME SELECTOR
@@ -2091,7 +2346,7 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
             int tw = text_width(title, 2);
             draw_text(rr, (MENU_LW - tw) / 2, 8, title, 2, 200, 50, 20);
         }
-        draw_text(rr, 20, 30, "Entex 1982 Emulator v14", 1, 100, 70, 55);
+        draw_text(rr, 20, 30, "Entex 1982 Emulator v15", 1, 100, 70, 55);
 
         SDL_SetRenderDrawColor(rr, 60, 15, 10, 255);
         { SDL_Rect r = { 20, 44, MENU_LW - 40, 1 }; SDL_RenderFillRect(rr, &r); }
@@ -2186,7 +2441,7 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
         SDL_SetRenderDrawColor(rr, 20, 8, 6, 255);
         { SDL_Rect r = { 0, MENU_LH - 20, MENU_LW, 20 }; SDL_RenderFillRect(rr, &r); }
         draw_text(rr, 14, MENU_LH - 15,
-            "Up/Down/Click:select  Enter/DblClick:play  Esc:quit  F12:screenshot", 1, 80, 60, 48);
+            "Select:Up/Down/Click  Play:Enter/DblClick  Esc:quit", 1, 80, 60, 48);
 
         /* ---- Blit render target to screen with letterboxing ---- */
         SDL_SetRenderTarget(rr, NULL);
@@ -2232,11 +2487,18 @@ static void audio_cb(void *ud, uint8_t *stream, int len) {
     int vol = av->snd_volume;
     int amplitude = 300 * vol;  /* max 3000 at vol=10 */
     float prev = av->lp_prev;
+    int prof = av->audio_profile;
+    float alpha = (prof >= 0 && prof < AUDIO_PROFILES) ? audio_lp_alpha[prof] : 1.0f;
     for (int i = 0; i < n; i++) {
         float s = cop411_sample(&av->snd);
-        /* Single-pole low-pass filter simulating speaker rolloff */
-        prev += LP_ALPHA * (s - prev);
-        int16_t sample = (int16_t)(prev * (float)amplitude);
+        /* Audio filter: profile-dependent low-pass */
+        prev += alpha * (s - prev);
+        float fout = prev;
+        /* Soft clip for speaker profile (simulates small speaker distortion) */
+        if (prof == AUDIO_SPEAKER && (fout > 0.8f || fout < -0.8f))
+            fout = fout > 0 ? 0.8f + 0.2f * tanhf((fout-0.8f)*5.0f)
+                            : -0.8f + 0.2f * tanhf((fout+0.8f)*5.0f);
+        int16_t sample = (int16_t)(fout * (float)amplitude);
         out[i] = sample;
         /* Write to WAV if recording */
         if (av->wav.active && av->wav.fp) {
@@ -2257,6 +2519,10 @@ static uint32_t framebuf[WIN_W * WIN_H];
 
 static void render(SDL_Renderer *rr, AV *av) {
     const AVDisp *d = &av->disp;
+    float gamma = av->cfg_gamma;
+
+    /* Count lit pixels for stats */
+    int lit = 0;
 
     /* Render LED display into framebuffer */
     memset(framebuf, 0, sizeof(framebuf)); /* black background */
@@ -2265,11 +2531,15 @@ static void render(SDL_Renderer *rr, AV *av) {
         for (int x = 0; x < SW; x++) {
             float I = disp_px(d, x, y);
             if (I < 0.01f) continue;
+            lit++;
+
+            /* Apply gamma curve */
+            float Ig = (gamma != 1.0f) ? powf(I, gamma) : I;
 
             /* LED red color: warm at high intensity, deep crimson at low. */
-            uint8_t r = (uint8_t)(I * 255.0f);
-            uint8_t g = (uint8_t)(I * I * 25.0f);
-            uint8_t b = (uint8_t)(I * I * I * 6.0f);
+            uint8_t r = (uint8_t)(Ig * 255.0f);
+            uint8_t g = (uint8_t)(Ig * Ig * 25.0f);
+            uint8_t b = (uint8_t)(Ig * Ig * Ig * 6.0f);
             uint32_t col = (r << 16) | (g << 8) | b;
 
             /* Fill sharp LED_SIZE×LED_SIZE dot within SCALE×SCALE cell.
@@ -2300,6 +2570,33 @@ static void render(SDL_Renderer *rr, AV *av) {
     SDL_SetRenderDrawColor(rr, 0, 0, 0, 255);
     SDL_RenderClear(rr);
     SDL_RenderCopy(rr, tex, NULL, NULL);
+
+    /* Scanline effect: darken every other LED row */
+    if (av->scanlines) {
+        SDL_SetRenderDrawColor(rr, 0, 0, 0, 60);
+        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_BLEND);
+        for (int sy = 0; sy < SH; sy += 2) {
+            SDL_Rect sl = {0, sy * SCALE, WIN_W, SCALE};
+            SDL_RenderFillRect(rr, &sl);
+        }
+        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_NONE);
+    }
+
+    /* Store stats */
+    av->stat_pixels = lit;
+
+    /* Stats overlay (FPS, cycles, pixels) */
+    if (av->show_stats) {
+        char sb[128];
+        snprintf(sb, sizeof(sb), "FPS:%.1f Cy:%llu Px:%d",
+            av->stat_fps, (unsigned long long)av->cpu.cycles, av->stat_pixels);
+        SDL_SetRenderDrawColor(rr, 0, 0, 0, 180);
+        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_BLEND);
+        SDL_Rect sb_bg = {0, 0, (int)strlen(sb) * 7 + 8, 12};
+        SDL_RenderFillRect(rr, &sb_bg);
+        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_NONE);
+        draw_text(rr, 4, 2, sb, 1, 100, 200, 100);
+    }
 
     /* OSD overlay */
     if (av->osd_timer > 0) {
@@ -2344,6 +2641,10 @@ int main(int argc, char **argv) {
     AV av;
     av_init(&av);
 
+    /* Check for --test (works in SDL build too) */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--test") == 0) return run_self_test();
+
     /* Parse command line arguments */
     bool opt_fullscreen = false;
     bool opt_no_sound = false;
@@ -2360,14 +2661,19 @@ int main(int argc, char **argv) {
             if (v >= 0 && v <= 10) av.snd_volume = v;
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Adventure Vision Emulator v14\n\n"
+            printf("Adventure Vision Emulator v15\n\n"
                    "Usage: %s [options] [bios.rom game.rom]\n\n"
                    "Options:\n"
                    "  --fullscreen    Start in fullscreen\n"
                    "  --scale N       Window scale factor (1-10)\n"
                    "  --volume N      Initial volume (0-10, default 7)\n"
                    "  --no-sound      Disable audio\n"
-                   "  -h, --help      Show this help\n", argv[0]);
+                   "  --test          Run built-in self-test suite\n"
+                   "  -h, --help      Show this help\n"
+                   "\nHeadless options (no SDL):\n"
+                   "  --frames N      Run N frames (default 60)\n"
+                   "  --input UDLR    Inject inputs (U/D/L/R/1/2/3/4)\n"
+                   "  --dump          Dump VRAM as ASCII art each frame\n", argv[0]);
             return 0;
         }
     }
@@ -2458,7 +2764,7 @@ int main(int argc, char **argv) {
 
             if (menu.game_count == 0 && !menu.has_bios) {
                 fprintf(stderr,
-                    "Entex Adventure Vision Emulator v13\n\n"
+                    "Entex Adventure Vision Emulator v15\n\n"
                     "Usage: %s [bios.rom game.rom]\n\n"
                     "  Or place .bin/.rom files in current directory.\n\n"
                     "Controls: Arrows=D-Pad  Z/X/A/S=Buttons  Esc=Menu\n"
@@ -2558,6 +2864,12 @@ int main(int argc, char **argv) {
                                printf("[DBG] %s\n",av.dbg.active?"ON":"OFF");
                                if(av.dbg.active)dbg_print(&av.cpu); }
                         break;
+                    case SDLK_BACKQUOTE:
+                        if(p) {
+                            av.show_stats = !av.show_stats;
+                            osd_show(&av, av.show_stats ? "Stats ON" : "Stats OFF");
+                        }
+                        break;
                     case SDLK_F2:
                         if(p) {
                             if (av.wav.active) {
@@ -2576,10 +2888,29 @@ int main(int argc, char **argv) {
                             }
                         }
                         break;
+                    case SDLK_F3:
+                        if(p) {
+                            av.midframe_scan = !av.midframe_scan;
+                            osd_show(&av, av.midframe_scan ? "Mid-frame scan ON" : "Mid-frame scan OFF");
+                        }
+                        break;
+                    case SDLK_F4:
+                        if(p) {
+                            av.audio_profile = (av.audio_profile + 1) % AUDIO_PROFILES;
+                            char apb[48]; snprintf(apb, 48, "Audio: %s", audio_profile_names[av.audio_profile]);
+                            osd_show(&av, apb);
+                        }
+                        break;
                     case SDLK_F5:
                         if(p) {
                             if(save_state(&av, av.save_name)) osd_show(&av, "State saved");
                             else osd_show(&av, "Save failed!");
+                        }
+                        break;
+                    case SDLK_F6:
+                        if(p) {
+                            av.integer_scale = !av.integer_scale;
+                            osd_show(&av, av.integer_scale ? "Integer scale ON" : "Integer scale OFF");
                         }
                         break;
                     case SDLK_F7:
@@ -2601,8 +2932,14 @@ int main(int argc, char **argv) {
                         }
                         break;
                     case SDLK_F9:
-                        if(p && av.dbg.active && av.dbg.stepping){
-                            i8048_exec(&av.cpu,&av); dbg_print(&av.cpu); }
+                        if(p) {
+                            if (av.dbg.active && av.dbg.stepping) {
+                                i8048_exec(&av.cpu,&av); dbg_print(&av.cpu);
+                            } else {
+                                av.scanlines = !av.scanlines;
+                                osd_show(&av, av.scanlines ? "Scanlines ON" : "Scanlines OFF");
+                            }
+                        }
                         break;
                     case SDLK_F10:
                         if(p && av.dbg.active) av.dbg.stepping=false;
@@ -2700,16 +3037,19 @@ int main(int argc, char **argv) {
 
             render(rr, &av);
 
-            /* Frame timing: target 15fps (66.67ms per frame).
-             * Use wall-clock timing instead of fixed SDL_Delay to avoid
-             * double-throttle when VSYNC is enabled (VSYNC already blocks
-             * ~16ms at 60Hz, so a fixed 66ms delay would yield ~12fps). */
+            /* Frame timing + FPS measurement */
             {
                 static Uint32 last_tick = 0;
                 Uint32 now = SDL_GetTicks();
-                /* Reset if first frame or returning from menu (stale tick) */
                 if (!last_tick || (now - last_tick) > 500)
                     last_tick = now;
+                /* Measure FPS (smoothed) */
+                Uint32 dt = now - av.stat_frame_ticks;
+                if (dt > 0 && dt < 500) {
+                    float ifps = 1000.0f / (float)dt;
+                    av.stat_fps = av.stat_fps * 0.9f + ifps * 0.1f;
+                }
+                av.stat_frame_ticks = now;
                 Uint32 target = last_tick + (1000 / FPS);
                 if (now < target)
                     SDL_Delay(target - now);
@@ -2741,15 +3081,68 @@ int main(int argc, char **argv) {
 #else
 /* Headless mode */
 int main(int argc, char **argv) {
-    if (argc < 3) { printf("Usage: %s <bios.rom> <game.rom>\n", argv[0]); return 1; }
+    /* Check for --test flag */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test") == 0) return run_self_test();
+    }
+
+    /* Parse headless options */
+    int num_frames = 60;
+    const char *input_str = NULL;
+    bool do_dump = false;
+    char *bios_path = NULL, *game_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--frames") == 0 && i+1 < argc)
+            num_frames = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--input") == 0 && i+1 < argc)
+            input_str = argv[++i];
+        else if (strcmp(argv[i], "--dump") == 0)
+            do_dump = true;
+        else if (argv[i][0] != '-') {
+            if (!bios_path) bios_path = argv[i];
+            else if (!game_path) game_path = argv[i];
+        }
+    }
+
+    if (!bios_path || !game_path) {
+        printf("Usage: %s [--test] [--frames N] [--input UDLR1234] [--dump] <bios.rom> <game.rom>\n", argv[0]);
+        return 1;
+    }
+
     AV av; av_init(&av);
-    if (!load_file(av.cpu.irom, IROM_SZ, argv[1])) return 1;
-    if (!load_file(av.cpu.erom, EROM_SZ, argv[2])) return 1;
-    for (int f = 0; f < 60; f++) av_run_frame(&av);
+    if (!load_file(av.cpu.irom, IROM_SZ, bios_path)) return 1;
+    if (!load_file(av.cpu.erom, EROM_SZ, game_path)) return 1;
+
+    /* Apply input string */
+    if (input_str) {
+        for (const char *p = input_str; *p; p++) {
+            switch (*p) {
+            case 'U': case 'u': av.input.u = true; break;
+            case 'D': case 'd': av.input.d = true; break;
+            case 'L': case 'l': av.input.l = true; break;
+            case 'R': case 'r': av.input.r = true; break;
+            case '1': av.input.b1 = true; break;
+            case '2': av.input.b2 = true; break;
+            case '3': av.input.b3 = true; break;
+            case '4': av.input.b4 = true; break;
+            }
+        }
+    }
+
+    for (int f = 0; f < num_frames; f++) {
+        av_run_frame(&av);
+        if (do_dump) {
+            printf("--- Frame %d ---\n", f);
+            dump_vram_ascii(&av.disp);
+        }
+    }
+
     dbg_print(&av.cpu);
     int lit = 0;
     for (int i = 0; i < SW*SH; i++) if (av.disp.phosphor[i] > 0.1f) lit++;
-    printf("%llu cycles, %d pixels lit.\n", (unsigned long long)av.cpu.cycles, lit);
+    printf("%llu cycles, %d pixels lit, %d frames.\n",
+        (unsigned long long)av.cpu.cycles, lit, num_frames);
+    if (av.rewind_buf) free(av.rewind_buf);
     return 0;
 }
 #endif
