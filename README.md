@@ -131,9 +131,18 @@ State loaded.
 
 Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/overflow, COP411L init/tone/noise, persistance phosphore, round-trip savestate complet.
 
+## Corrections v15.1 (audit de code)
+
+- **Thread safety** : tout accès à `av->snd` (save/load state, rewind push/pop) est maintenant sous `SDL_LockAudioDevice` ; macros `AUDIO_LOCK`/`AUDIO_UNLOCK` pour cohérence
+- **WAV ring buffer** : `audio_cb` écrit dans un tampon annulaire (8192 samples), vidé côté thread principal — plus aucune E/S disque dans le thread audio
+- **Préservation de l'état persistant** : le retour au menu ne perd plus `rewind_buf`, `wav`, volume, gamma, config ; plus de fuite mémoire ni de fichier WAV orphelin
+- **load_file robuste** : avertissement explicite si ROM tronquée, échec sur lecture partielle
+- **CLI sûre** : `atoi` remplacé par `strtol` avec validation complète
+- **Pas de deadlock** : les verrous internes redondants dans `load_state` sont supprimés (l'appelant verrouille)
+
 ## Architecture
 
-Émulateur mono-fichier C (~3150 lignes), zéro dépendance externe hors SDL2.
+Émulateur mono-fichier C (~3270 lignes), zéro dépendance externe hors SDL2.
 
 | Module | Lignes | Description |
 |--------|--------|-------------|

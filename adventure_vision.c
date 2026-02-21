@@ -57,6 +57,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
+#include <errno.h>
 
 /* Portable strcasestr for MSVC and other non-GNU systems */
 #if defined(_MSC_VER) || !defined(__GLIBC__)
@@ -77,6 +78,9 @@ static char *strcasestr(const char *haystack, const char *needle) {
 
 #ifdef USE_SDL
 #include <SDL2/SDL.h>
+/* Convenience macros for audio thread safety */
+#define AUDIO_LOCK(av)   do { if ((av)->adev) SDL_LockAudioDevice((SDL_AudioDeviceID)(av)->adev); } while(0)
+#define AUDIO_UNLOCK(av) do { if ((av)->adev) SDL_UnlockAudioDevice((SDL_AudioDeviceID)(av)->adev); } while(0)
 /* Ensure key defines exist (some minimal SDL builds miss these) */
 #ifndef SDLK_F3
 #define SDLK_F3 (SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_F3))
@@ -902,11 +906,16 @@ typedef struct {
     uint16_t snd_lfsr;
 } RewindSnap;
 
-/* WAV file writer state */
+/* WAV file writer state — ring buffer decouples audio thread from disk I/O */
+#define WAV_RING_SZ  8192  /* must be power of 2 */
 typedef struct {
     FILE *fp;
     uint32_t samples_written;
     bool active;
+    /* Ring buffer: audio thread writes, main thread flushes */
+    int16_t ring[WAV_RING_SZ];
+    volatile uint32_t ring_wr;  /* written by audio thread */
+    uint32_t ring_rd;           /* read by main thread */
 } WavWriter;
 
 struct AV {
@@ -1161,11 +1170,29 @@ static void wav_start(WavWriter *w, const char *fn) {
     memcpy(hdr+36, "data", 4);
     fwrite(hdr, 44, 1, w->fp);
     w->samples_written = 0;
+    w->ring_wr = 0;
+    w->ring_rd = 0;
     w->active = true;
+}
+
+/* Flush ring buffer to disk — called from main thread only */
+static void wav_flush(WavWriter *w) {
+    if (!w->fp || !w->active) return;
+    uint32_t rd = w->ring_rd;
+    uint32_t wr = w->ring_wr;  /* atomic read (single-writer) */
+    while (rd != wr) {
+        int16_t s = w->ring[rd & (WAV_RING_SZ - 1)];
+        fwrite(&s, sizeof(int16_t), 1, w->fp);
+        w->samples_written++;
+        rd++;
+    }
+    w->ring_rd = rd;
 }
 
 static void wav_stop(WavWriter *w) {
     if (!w->fp) return;
+    /* Flush any remaining samples from the ring buffer */
+    wav_flush(w);
     uint32_t data_sz = w->samples_written * 2;
     uint32_t riff_sz = data_sz + 36;
     fseek(w->fp, 4, SEEK_SET); fwrite(&riff_sz, 4, 1, w->fp);
@@ -1248,15 +1275,22 @@ static bool load_file(uint8_t *dest, int max_sz, const char *fn) {
     FILE *f = fopen(fn, "rb");
     if (!f) { fprintf(stderr, "Cannot open '%s'\n", fn); return false; }
     fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz < 0) { fprintf(stderr, "Cannot read size of '%s'\n", fn); fclose(f); return false; }
+    long file_sz = ftell(f);
+    if (file_sz < 0) { fprintf(stderr, "Cannot read size of '%s'\n", fn); fclose(f); return false; }
+    if (file_sz == 0) { fprintf(stderr, "Empty file: '%s'\n", fn); fclose(f); return false; }
+    if (file_sz > max_sz) {
+        fprintf(stderr, "Warning: '%s' is %ld bytes, truncating to %d\n", fn, file_sz, max_sz);
+        file_sz = max_sz;
+    }
     fseek(f, 0, SEEK_SET);
-    if (sz > max_sz) sz = max_sz;
-    if (sz == 0) { fprintf(stderr, "Empty file: '%s'\n", fn); fclose(f); return false; }
-    size_t n = fread(dest, 1, (size_t)sz, f);
+    size_t n = fread(dest, 1, (size_t)file_sz, f);
     fclose(f);
+    if ((long)n != file_sz) {
+        fprintf(stderr, "Read error: expected %ld bytes, got %zu from '%s'\n", file_sz, n, fn);
+        return false;
+    }
     printf("Loaded %zu bytes from '%s'\n", n, fn);
-    return n > 0;
+    return true;
 }
 
 /* Run one frame of CPU execution with T1 mirror timing */
@@ -1315,8 +1349,14 @@ static void av_run_frame(AV *av) {
     /* Update display from captured columns */
     disp_update(&av->disp, av->cfg_phosphor);
     av->frame_count++;
-    /* Push rewind snapshot every frame */
+    /* Push rewind snapshot every frame (lock to protect snd fields) */
+#ifdef USE_SDL
+    AUDIO_LOCK(av);
+#endif
     rewind_push(av);
+#ifdef USE_SDL
+    AUDIO_UNLOCK(av);
+#endif
 }
 
 /* ---- Save/Load with validation ---- */
@@ -1445,13 +1485,7 @@ static bool load_state(AV *av, const char *fn) {
     if (!ok) {
         fprintf(stderr, "Corrupt save file\n");
         av->cpu = cpu_bak;
-#ifdef USE_SDL
-        if (av->adev) SDL_LockAudioDevice((SDL_AudioDeviceID)av->adev);
-#endif
-        av->snd = snd_bak;
-#ifdef USE_SDL
-        if (av->adev) SDL_UnlockAudioDevice((SDL_AudioDeviceID)av->adev);
-#endif
+        av->snd = snd_bak;  /* caller holds audio lock */
         return false;
     }
 
@@ -1479,14 +1513,9 @@ static bool load_state(AV *av, const char *fn) {
     if (av->snd.proto_state > 3) av->snd.proto_state = 0;
     av->snd.proto_hi &= 0x0F;
 
-#ifdef USE_SDL
-    if (av->adev) SDL_LockAudioDevice((SDL_AudioDeviceID)av->adev);
-#endif
     cop411_update_ctrl_vol(&av->snd);
-    /* v15: full COP411L state is now restored from savestate */
-#ifdef USE_SDL
-    if (av->adev) SDL_UnlockAudioDevice((SDL_AudioDeviceID)av->adev);
-#endif
+    /* v15: full COP411L state is now restored from savestate.
+     * Caller holds audio lock (no deadlock). */
     printf("State loaded.\n");
     return true;
 }
@@ -2500,10 +2529,11 @@ static void audio_cb(void *ud, uint8_t *stream, int len) {
                             : -0.8f + 0.2f * tanhf((fout+0.8f)*5.0f);
         int16_t sample = (int16_t)(fout * (float)amplitude);
         out[i] = sample;
-        /* Write to WAV if recording */
-        if (av->wav.active && av->wav.fp) {
-            fwrite(&sample, sizeof(int16_t), 1, av->wav.fp);
-            av->wav.samples_written++;
+        /* Enqueue to WAV ring buffer (lock-free: single writer) */
+        if (av->wav.active) {
+            uint32_t wi = av->wav.ring_wr;
+            av->wav.ring[wi & (WAV_RING_SZ - 1)] = sample;
+            av->wav.ring_wr = wi + 1;
         }
     }
     av->lp_prev = prev;
@@ -2653,12 +2683,14 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--fullscreen") == 0) opt_fullscreen = true;
         else if (strcmp(argv[i], "--no-sound") == 0) opt_no_sound = true;
         else if (strcmp(argv[i], "--scale") == 0 && i+1 < argc) {
-            opt_scale = atoi(argv[++i]);
-            if (opt_scale < 1 || opt_scale > 10) opt_scale = 0;
+            char *end; long lv = strtol(argv[++i], &end, 10);
+            if (*end == '\0' && lv >= 1 && lv <= 10) opt_scale = (int)lv;
+            else fprintf(stderr, "Invalid --scale value, ignoring\n");
         }
         else if (strcmp(argv[i], "--volume") == 0 && i+1 < argc) {
-            int v = atoi(argv[++i]);
-            if (v >= 0 && v <= 10) av.snd_volume = v;
+            char *end; long lv = strtol(argv[++i], &end, 10);
+            if (*end == '\0' && lv >= 0 && lv <= 10) av.snd_volume = (int)lv;
+            else fprintf(stderr, "Invalid --volume value, ignoring\n");
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Adventure Vision Emulator v15\n\n"
@@ -2746,9 +2778,78 @@ int main(int argc, char **argv) {
     /* ===== OUTER LOOP: menu → game → menu ===== */
     while (1) {
         char game_title[256] = "Adventure Vision";
-        uint32_t saved_adev = av.adev; /* preserve across av_init */
-        av_init(&av);
-        av.adev = saved_adev;
+
+        /* Reset emulation state for new game, preserving persistent fields:
+         * adev, rewind_buf, wav, config (volume, scale, gamma, etc.) */
+        {
+            /* Stop WAV if active before resetting */
+            if (av.wav.active) {
+                if (adev) SDL_LockAudioDevice(adev);
+                av.wav.active = false;
+                if (adev) SDL_UnlockAudioDevice(adev);
+                wav_stop(&av.wav);
+            }
+            /* Save persistent fields */
+            uint32_t      p_adev       = av.adev;
+            RewindSnap   *p_rwbuf      = av.rewind_buf;
+            int           p_volume     = av.snd_volume;
+            int           p_scale      = av.cfg_scale;
+            bool          p_no_sound   = av.cfg_no_sound;
+            int           p_aprofile   = av.audio_profile;
+            float         p_gamma      = av.cfg_gamma;
+            float         p_phosphor   = av.cfg_phosphor;
+            bool          p_scanlines  = av.scanlines;
+            bool          p_intscale   = av.integer_scale;
+            bool          p_stats      = av.show_stats;
+            bool          p_midframe   = av.midframe_scan;
+            int           p_t1start    = av.t1_pulse_start;
+            int           p_t1end      = av.t1_pulse_end;
+            /* Reset core state */
+            memset(&av.cpu, 0, sizeof(I8048));
+            memset(&av.disp, 0, sizeof(AVDisp));
+            memset(&av.input, 0, sizeof(av.input));
+            av.running = true;
+            av.paused = false;
+            av.back_to_menu = false;
+            av.frame_count = 0;
+            av.osd_text[0] = 0;
+            av.osd_timer = 0;
+            av.stat_frame_ticks = 0;
+            av.stat_fps = 0;
+            av.stat_pixels = 0;
+            memset(&av.dbg, 0, sizeof(av.dbg));
+            av.dbg_run_to = 0xFFFF;
+            av.dbg_watch_addr = 0xFFFF;
+            av.dbg_watch_en = false;
+            av.lp_prev = 0;
+            /* Init CPU */
+            av.cpu.P1 = 0xFB;
+            av.cpu.P2 = 0xFF;
+            av.cpu.t0 = true;
+            memset(av.cpu.xram + 0x100, 0xFF, 0x300);
+            /* Init sound (under lock since audio thread may be running) */
+            if (adev) SDL_LockAudioDevice(adev);
+            cop411_init(&av.snd);
+            if (adev) SDL_UnlockAudioDevice(adev);
+            snprintf(av.save_name, sizeof(av.save_name), "advision.sav");
+            /* Restore persistent fields */
+            av.adev          = p_adev;
+            av.rewind_buf    = p_rwbuf;
+            av.rewind_head   = 0;
+            av.rewind_count  = 0;
+            av.snd_volume    = p_volume;
+            av.cfg_scale     = p_scale;
+            av.cfg_no_sound  = p_no_sound;
+            av.audio_profile = p_aprofile;
+            av.cfg_gamma     = p_gamma;
+            av.cfg_phosphor  = p_phosphor;
+            av.scanlines     = p_scanlines;
+            av.integer_scale = p_intscale;
+            av.show_stats    = p_stats;
+            av.midframe_scan = p_midframe;
+            av.t1_pulse_start= p_t1start;
+            av.t1_pulse_end  = p_t1end;
+        }
 
         if (direct_mode) {
             if (!load_file(av.cpu.irom, IROM_SZ, pos_argv[0])) break;
@@ -2873,6 +2974,9 @@ int main(int argc, char **argv) {
                     case SDLK_F2:
                         if(p) {
                             if (av.wav.active) {
+                                AUDIO_LOCK(&av);
+                                av.wav.active = false;  /* signal audio thread to stop writing */
+                                AUDIO_UNLOCK(&av);
                                 wav_stop(&av.wav);
                                 osd_show(&av, "WAV saved");
                             } else {
@@ -2903,8 +3007,10 @@ int main(int argc, char **argv) {
                         break;
                     case SDLK_F5:
                         if(p) {
-                            if(save_state(&av, av.save_name)) osd_show(&av, "State saved");
-                            else osd_show(&av, "Save failed!");
+                            AUDIO_LOCK(&av);
+                            bool saved = save_state(&av, av.save_name);
+                            AUDIO_UNLOCK(&av);
+                            osd_show(&av, saved ? "State saved" : "Save failed!");
                         }
                         break;
                     case SDLK_F6:
@@ -2915,16 +3021,20 @@ int main(int argc, char **argv) {
                         break;
                     case SDLK_F7:
                         if(p) {
-                            if(load_state(&av, av.save_name)) osd_show(&av, "State loaded");
-                            else osd_show(&av, "No save found");
+                            AUDIO_LOCK(&av);
+                            bool loaded = load_state(&av, av.save_name);
+                            AUDIO_UNLOCK(&av);
+                            osd_show(&av, loaded ? "State loaded" : "No save found");
                         }
                         break;
                     case SDLK_F8:
                         if(p) {
                             /* Rewind: pop multiple frames for visible effect */
+                            AUDIO_LOCK(&av);
                             int rw = 0;
                             for (int ri = 0; ri < 4; ri++)
                                 if (rewind_pop(&av)) rw++;
+                            AUDIO_UNLOCK(&av);
                             if (rw > 0) {
                                 char rb[32]; snprintf(rb, 32, "Rewind -%d", rw);
                                 osd_show(&av, rb);
@@ -3037,6 +3147,9 @@ int main(int argc, char **argv) {
 
             render(rr, &av);
 
+            /* Flush WAV ring buffer to disk (main thread only) */
+            if (av.wav.active) wav_flush(&av.wav);
+
             /* Frame timing + FPS measurement */
             {
                 static Uint32 last_tick = 0;
@@ -3065,7 +3178,12 @@ int main(int argc, char **argv) {
     config_save(&av, fullscreen);
 
     /* Stop WAV recording if active */
-    if (av.wav.active) wav_stop(&av.wav);
+    if (av.wav.active) {
+        if (adev) SDL_LockAudioDevice(adev);
+        av.wav.active = false;
+        if (adev) SDL_UnlockAudioDevice(adev);
+        wav_stop(&av.wav);
+    }
 
     /* Free rewind buffer */
     if (av.rewind_buf) { free(av.rewind_buf); av.rewind_buf = NULL; }
@@ -3092,8 +3210,10 @@ int main(int argc, char **argv) {
     bool do_dump = false;
     char *bios_path = NULL, *game_path = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--frames") == 0 && i+1 < argc)
-            num_frames = atoi(argv[++i]);
+        if (strcmp(argv[i], "--frames") == 0 && i+1 < argc) {
+            char *end; long lv = strtol(argv[++i], &end, 10);
+            if (*end == '\0' && lv > 0 && lv < 1000000) num_frames = (int)lv;
+        }
         else if (strcmp(argv[i], "--input") == 0 && i+1 < argc)
             input_str = argv[++i];
         else if (strcmp(argv[i], "--dump") == 0)
