@@ -51,7 +51,6 @@
 | **Super Cobra** | 1982 | Shoot horizontal | Z:tir X:bombe |
 | **Space Force** | 1982 | Tir fixe | Z:tir |
 | **Turtles** | 1982 | Labyrinthe | Flèches Z:boîte |
-| **Table Tennis** | 1982 | Sport/Pong | ↑↓:raquette Z:service |
 
 ## Compilation
 
