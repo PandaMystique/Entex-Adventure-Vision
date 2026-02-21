@@ -1973,11 +1973,11 @@ static const GameInfo game_db[] = {
         NULL },
       "Arrows:move Z:mystery box"
     },
-    { "Table Tennis", "1982", "Entex",
+    { "Table Tennis", "2020", "Ben Larson (homebrew)",
       "Sports / Pong",
-      { "Classic table tennis / Pong",
-        "gameplay on the Adventure",
-        "Vision's unique LED display.",
+      { "Homebrew table tennis / Pong",
+        "for the Adventure Vision's",
+        "unique LED display.",
         NULL, NULL },
       "Up/Down:paddle Z:serve"
     },
