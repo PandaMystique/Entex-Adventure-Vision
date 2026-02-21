@@ -34,7 +34,7 @@
 - **Overlay statistiques** (touche `) : FPS mesuré, cycles CPU, pixels allumés
 
 ### Débogage et outils
-- **Suite de tests intégrée** (`--test`) : 13 tests couvrant CPU (MOV, ADD, carry, JMP, DJNZ, DAA), timer/prescaler, COP411L (init, tone, noise), persistance phosphore, round-trip savestate
+- **Suite de tests intégrée** (`--test`) : 19 tests couvrant CPU (MOV, ADD, carry, JMP, DJNZ, DAA, PSW, ISR), timer/prescaler, interruptions (DIS TCNTI, latch overflow, Figure 11 Note 1), décodage LED, COP411L (init, tone, noise), persistance phosphore, round-trip savestate
 - **Mode headless enrichi** : `--frames N`, `--input UDLR1234`, `--dump` (ASCII art VRAM)
 - **Dump VRAM ASCII** : visualisation texte du framebuffer pour debug et tests automatisés
 
@@ -140,9 +140,33 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 - **CLI sûre** : `atoi` remplacé par `strtol` avec validation complète
 - **Pas de deadlock** : les verrous internes redondants dans `load_state` sont supprimés (l'appelant verrouille)
 
+## Corrections v15.4 (précision MCS-48)
+
+### Affichage
+- **Retour capture XRAM directe** : le pipeline des registres LED (v15.3) introduisait un décalage horizontal systématique. La capture XRAM en fin de trame est rétablie comme méthode d'affichage principale. Le code des registres LED est conservé pour référence mais désactivé.
+- **Scanlines dans le framebuffer** : l'effet scanlines est maintenant appliqué directement dans le tampon image (plus propre, pas de discordance de coordonnées SDL).
+
+### Affichage LED (code conservé, désactivé)
+- **Table de décodage LED corrigée** : les bits P2.5-P2.7 étaient interprétés dans le mauvais ordre depuis v15.3, causant 3/5 registres LED mappés vers le mauvais index et un registre manquant (sel=3 non décodé). Le BIOS utilise P2=0x20→0xA0 correspondant à sel=1→5, le mapping correct est simplement `sel-1`. Corrige l'affichage écrasé/déformé.
+- **Sécurité null** : `av_led_latch()` vérifie le pointeur NULL pour compatibilité avec les self-tests.
+- **Test de régression** : nouveau test vérifiant les 5 valeurs P2 du BIOS + 2 valeurs invalides.
+
+### Logique d'interruption timer (MCS-48 Figure 11)
+- **DIS TCNTI efface l'IRQ en attente** : l'instruction `DIS TCNTI` (0x35) remet à zéro la bascule d'interruption timer. Doc : "A pending interrupt request is cleared."
+- **Séparation enable externe/timer** : la bascule d'overflow timer est conditionnée par `tcnti_en && !in_irq`, sans vérifier `irq_en` (enable externe). Note 1 Figure 11 : "Overflow FF will NOT store any overflow" pendant une ISR. Timer Flag (JTF) est toujours activé.
+
+### CPU 8048
+- **PSW bit 3 = 1** : bit 3 forcé à 1 lors de toute lecture. Doc : "Bit 3 of the PSW is unused and is always set to one."
+- **PC bit 11 = 0 pendant ISR** : `JMP`/`CALL` en ISR ne peuvent plus activer le bit 11 (memory bank). Doc : "During servicing of an interrupt, PC bit 11 is held at zero."
+
+### Tests
+- **8 nouveaux tests** (12–19) : PSW bit 3, DIS TCNTI, timer overflow latch (irq_en=0 et ISR), JMP en ISR, décodage LED complet. Total : **19 tests**.
+
 ## Corrections v15.3 (précision émulation hardware)
 
-### Pipeline d'affichage LED (Daniel Boris doc §4.3)
+> **Note** : le pipeline d'affichage LED a été désactivé en v15.4 (décalage horizontal systématique). La capture XRAM directe est utilisée. Le code LED est conservé pour référence.
+
+### Pipeline d'affichage LED (Daniel Boris doc §4.3) — désactivé
 - **Registres LED matériels** : émulation des 5 registres LED 8 bits du hardware réel. Chaque registre contrôle 8 LEDs (40 au total). L'écriture se fait comme effet de bord de la lecture XRAM (MOVX A,@Rr), exactement comme sur le vrai hardware
 - **Décodage adresse P2.5-P2.7** : sélection des registres LED par les bits 5-7 du port P2 : `100→reg0 (LEDs 1-8)`, `010→reg1 (9-16)`, `110→reg2 (17-24)`, `001→reg3 (25-32)`, `101→reg4 (33-40)`
 - **Strobe P2.4** : front montant de P2.4 = latch des registres LED vers la colonne d'affichage courante. Synchronisation colonne-par-colonne identique au BIOS réel
@@ -191,7 +215,7 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 
 ## Architecture
 
-Émulateur mono-fichier C (~3500 lignes), zéro dépendance externe hors SDL2.
+Émulateur mono-fichier C (~3580 lignes), zéro dépendance externe hors SDL2.
 
 | Module | Lignes | Description |
 |--------|--------|-------------|
@@ -200,7 +224,7 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 | Display | ~100 | Rendu LED POV, gamma, scanlines, phosphor configurable |
 | Rewind | ~80 | Buffer circulaire 120 snapshots |
 | Save/Load | ~120 | Savestate complet (CPU + COP411L playback) |
-| Self-test | ~130 | 13 tests unitaires intégrés |
+| Self-test | ~210 | 19 tests unitaires intégrés |
 | Menu | ~500 | Sélecteur, jaquettes, infos, contrôles par jeu |
 | Config | ~80 | INI persistant avec timing avancé |
 

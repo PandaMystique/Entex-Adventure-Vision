@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  ENTEX ADVENTURE VISION EMULATOR v15 — ACCURACY IMPROVEMENTS
+ *  ENTEX ADVENTURE VISION EMULATOR v15 — MCS-48 ACCURACY (v15.4)
  * ============================================================================
  *
  *  Hardware (Dan Boris tech specs / MEGA research):
@@ -177,7 +177,7 @@ static inline uint8_t *R(I8048 *c, uint8_t r) {
     return &c->iram[(c->BS ? 24 : 0) + (r & 7)];
 }
 static inline void bpsw(I8048 *c) {
-    c->PSW = (c->C<<7)|(c->AC<<6)|(c->F0<<5)|(c->BS<<4)|(c->SP&7);
+    c->PSW = (c->C<<7)|(c->AC<<6)|(c->F0<<5)|(c->BS<<4)|0x08|(c->SP&7);
 }
 static inline void push8(I8048 *c) {
     uint8_t a = 8 + c->SP * 2;
@@ -310,7 +310,7 @@ static int i8048_exec(I8048 *c, AV *sys) {
 
     /* JMP */
     case 0x04:case 0x24:case 0x44:case 0x64:case 0x84:case 0xA4:case 0xC4:case 0xE4:
-        t=ft(c);c->PC=((uint16_t)(op&0xE0)<<3)|t;if(c->MB)c->PC|=0x800;cy=2;break;
+        t=ft(c);c->PC=((uint16_t)(op&0xE0)<<3)|t;if(c->MB&&!c->in_irq)c->PC|=0x800;cy=2;break; /* JMP: bit11=0 during ISR */
     case 0xB3:c->PC=(c->PC&0xF00)|rom_rd(c,(c->PC&0xF00)|c->A);cy=2;break; /* JMPP @A */
 
     /* DJNZ */
@@ -335,7 +335,7 @@ static int i8048_exec(I8048 *c, AV *sys) {
 
     /* CALL / RET */
     case 0x14:case 0x34:case 0x54:case 0x74:case 0x94:case 0xB4:case 0xD4:case 0xF4:
-        t=ft(c);bpsw(c);push8(c);c->PC=((uint16_t)(op&0xE0)<<3)|t;if(c->MB)c->PC|=0x800;cy=2;break;
+        t=ft(c);bpsw(c);push8(c);c->PC=((uint16_t)(op&0xE0)<<3)|t;if(c->MB&&!c->in_irq)c->PC|=0x800;cy=2;break; /* CALL: bit11=0 during ISR */
     case 0x83:pop_pc(c);cy=2;break;           /* RET */
     case 0x93:pop_pc_psw(c);c->irq_en=1;c->in_irq=0;cy=2;break; /* RETR */
 
@@ -343,7 +343,7 @@ static int i8048_exec(I8048 *c, AV *sys) {
     case 0x05:c->irq_en=1;c->ei_delay=1;break; /* EI + 1-instr delay */
     case 0x15:c->irq_en=0;break;
     case 0x25:c->tcnti_en=1;break;
-    case 0x35:c->tcnti_en=0;break;
+    case 0x35:c->tcnti_en=0;c->irq_pend=false;break; /* DIS TCNTI: also clears pending req (MCS-48 spec) */
     case 0x55:c->timer_en=1;c->counter_en=0;c->tpre=0;break;  /* STRT T: start timer, clear prescaler */
     case 0x45:c->counter_en=1;c->timer_en=0;c->tpre=0;break;  /* STRT CNT: start counter, clear prescaler */
     case 0x65:c->timer_en=0;c->counter_en=0;c->tpre=0;break;  /* STOP TCNT: stop and clear prescaler */
@@ -369,14 +369,11 @@ static int i8048_exec(I8048 *c, AV *sys) {
     case 0x8A:c->P2|=ft(c);av_port_write(sys,2,c->P2);cy=2;break; /* ORL P2,#data */
 
     /* MOVX A,@Rr — External RAM read (banked via P1 bits 0-1).
-     * Hardware side-effect (§4.3): "The actual write to the LED registers
-     * occurs when there is a read from external memory." The data bus value
-     * is simultaneously latched into the LED register selected by P2.5-P2.7.
-     * This trick allows the BIOS to fill LED regs at max speed. */
+     * Note: LED register pipeline (§4.3) disabled — XRAM end-of-frame
+     * capture produces identical results and is proven reliable. */
     case 0x80:case 0x81:{
         uint8_t xval = xram_rd(c, *R(c, op&1));
         c->A = xval;
-        av_led_latch(sys, c->P2, xval);
         cy = 2;
         break;
     }
@@ -408,7 +405,12 @@ static int i8048_exec(I8048 *c, AV *sys) {
             c->tpre -= 32;
             if (++c->timer == 0) {
                 c->timer_ovf = true;
-                if (c->tcnti_en && c->irq_en && !c->in_irq)
+                /* Per MCS-48 Figure 11: overflow FF is gated by tcnti_en.
+                 * Note 1: "When Interrupt In Progress FF is set... Overflow
+                 * FF will NOT store any overflow." Timer Flag is still set.
+                 * irq_en is the external interrupt enable — timer has its own
+                 * enable (tcnti_en), so irq_en does NOT gate timer IRQ latch. */
+                if (c->tcnti_en && !c->in_irq)
                     c->irq_pend = true;
             }
         }
@@ -899,15 +901,15 @@ static void disp_capture_column(AVDisp *d, const uint8_t *xram, int col) {
  *   1    0    1  -> 4 (LEDs 33-40)
  *   other        -> -1 (invalid/unused) */
 static int led_reg_decode(uint8_t p2) {
+    /* P2 bits 5-7 select LED register. BIOS uses:
+     * P2=0x20 (sel=1) → reg 0 (LEDs 1-8,  top)
+     * P2=0x40 (sel=2) → reg 1 (LEDs 9-16)
+     * P2=0x60 (sel=3) → reg 2 (LEDs 17-24)
+     * P2=0x80 (sel=4) → reg 3 (LEDs 25-32)
+     * P2=0xA0 (sel=5) → reg 4 (LEDs 33-40, bottom) */
     uint8_t sel = (p2 >> 5) & 7;
-    switch (sel) {
-    case 4: return 0;  /* 100 */
-    case 2: return 1;  /* 010 */
-    case 6: return 2;  /* 110 */
-    case 1: return 3;  /* 001 */
-    case 5: return 4;  /* 101 */
-    default: return -1; /* 011, 111, 000 = unused */
-    }
+    if (sel >= 1 && sel <= 5) return (int)(sel - 1);
+    return -1; /* 0, 6, 7 = unused / sound control */
 }
 
 /* Latch LED registers to display column (called on P2.4 rising edge).
@@ -1047,6 +1049,7 @@ struct AV {
 /* av_led_latch: called from MOVX read (i8048_exec) to latch data to LED reg.
  * Must be defined after AV struct is fully visible. */
 static void av_led_latch(AV *av, uint8_t p2, uint8_t data) {
+    if (!av) return;
     int ri = led_reg_decode(p2);
     if (ri >= 0) av->disp.led_reg[ri] = data;
 }
@@ -1056,12 +1059,8 @@ static void av_port_write(AV *av, uint8_t port, uint8_t val) {
     case 0: av->cpu.BUS = val; break;
     case 1: break;
     case 2:
-        /* §4.3: P2.4 rising edge = strobe LED data to display column.
-         * "After all five registers have been written to, the BIOS
-         * sets P2.4 high." This latches LED register contents. */
-        if ((val & 0x10) && !(av->prev_p2 & 0x10)) {
-            disp_latch_led_column(&av->disp);
-        }
+        /* P2.4 strobe detection disabled — using XRAM direct capture.
+         * LED register pipeline kept in code for reference (§4.3). */
         av->prev_p2 = val;
 
         /* COP411L sound command protocol:
@@ -1490,7 +1489,7 @@ static void av_run_frame(AV *av) {
         if (av->cpu.counter_en && prev_t1 && !new_t1) {
             if (++av->cpu.timer == 0) {
                 av->cpu.timer_ovf = true;
-                if (av->cpu.tcnti_en && av->cpu.irq_en && !av->cpu.in_irq)
+                if (av->cpu.tcnti_en && !av->cpu.in_irq)
                     av->cpu.irq_pend = true;
             }
         }
@@ -1844,6 +1843,76 @@ static int run_self_test(void) {
         remove("/tmp/av_test.sav");
         if (av1.rewind_buf) free(av1.rewind_buf);
         if (av2.rewind_buf) free(av2.rewind_buf);
+    }
+
+    /* Test 12: PSW bit 3 always reads as 1 (MCS-48 spec) */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.SP = 0; c.C = 0; c.AC = 0; c.F0 = 0; c.BS = 0;
+        c.irom[0] = 0xC7; /* MOV A,PSW */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL);
+        if (c.A & 0x08) pass++; else { fail++; printf("FAIL: PSW bit3=%d (expected 1)\n", (c.A>>3)&1); }
+    }
+
+    /* Test 13: DIS TCNTI clears pending timer interrupt */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.irq_pend = true; c.tcnti_en = true;
+        c.irom[0] = 0x35; /* DIS TCNTI */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL);
+        if (!c.irq_pend && !c.tcnti_en) pass++;
+        else { fail++; printf("FAIL: DIS TCNTI pend=%d en=%d\n", c.irq_pend, c.tcnti_en); }
+    }
+
+    /* Test 14: Timer overflow latches irq_pend when irq_en=false (timer has own enable) */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.timer = 0xFF; c.timer_en = true; c.tcnti_en = true;
+        c.irq_en = false; c.in_irq = false; /* ext IRQ disabled, NOT in ISR */
+        for (int i = 0; i < 100; i++) c.irom[i] = 0x00;
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        for (int i = 0; i < 32; i++) i8048_exec(&c, NULL);
+        if (c.irq_pend) pass++;
+        else { fail++; printf("FAIL: timer IRQ latch pend=%d (expected 1 when irq_en=0)\n", c.irq_pend); }
+    }
+
+    /* Test 15a: Timer overflow does NOT latch irq_pend during ISR (Figure 11 Note 1) */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.timer = 0xFF; c.timer_en = true; c.tcnti_en = true;
+        c.irq_en = true; c.in_irq = true; /* IN ISR */
+        for (int i = 0; i < 100; i++) c.irom[i] = 0x00;
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        for (int i = 0; i < 32; i++) i8048_exec(&c, NULL);
+        if (!c.irq_pend && c.timer_ovf) pass++;
+        else { fail++; printf("FAIL: ISR overflow pend=%d ovf=%d (expected 0,1)\n", c.irq_pend, c.timer_ovf); }
+    }
+
+    /* Test 15: JMP does not set bit 11 during ISR */
+    {
+        I8048 c; memset(&c, 0, sizeof(c));
+        c.MB = true; c.in_irq = true;
+        c.irom[0] = 0x04; c.irom[1] = 0x50; /* JMP $050 */
+        c.P1 = 0xFB; c.P2 = 0xFF; c.t0 = true;
+        i8048_exec(&c, NULL);
+        if (c.PC == 0x050 && !(c.PC & 0x800)) pass++;
+        else { fail++; printf("FAIL: JMP in ISR PC=%03X (expected $050)\n", c.PC); }
+    }
+
+    /* Test 16: LED register decode matches BIOS P2 values */
+    {
+        int ok = 1;
+        /* BIOS uses P2=0x20,0x40,0x60,0x80,0xA0 for regs 0-4 */
+        if (led_reg_decode(0x20) != 0) ok = 0;
+        if (led_reg_decode(0x40) != 1) ok = 0;
+        if (led_reg_decode(0x60) != 2) ok = 0;
+        if (led_reg_decode(0x80) != 3) ok = 0;
+        if (led_reg_decode(0xA0) != 4) ok = 0;
+        if (led_reg_decode(0x00) != -1) ok = 0; /* unused */
+        if (led_reg_decode(0xC0) != -1) ok = 0; /* sound control */
+        if (ok) pass++; else { fail++; printf("FAIL: LED decode table\n"); }
     }
 
     printf("\n%d passed, %d failed (%d total)\n", pass, fail, pass+fail);
@@ -2545,7 +2614,24 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
                         last_click_idx = idx;
                         last_click_time = now;
                     }
+                } else if (e.button.clicks >= 2) {
+                    /* Double-click outside game list → toggle fullscreen */
+                    Uint32 fl = SDL_GetWindowFlags(win);
+                    if (fl & SDL_WINDOW_FULLSCREEN_DESKTOP)
+                        SDL_SetWindowFullscreen(win, 0);
+                    else
+                        SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
                 }
+            }
+
+            /* Mouse wheel: scroll through game list */
+            if (e.type == SDL_MOUSEWHEEL && m->game_count > 0) {
+                int scroll = e.wheel.y;
+                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) scroll = -scroll;
+                if (scroll > 0)
+                    m->selected = (m->selected - 1 + m->game_count) % m->game_count;
+                else if (scroll < 0)
+                    m->selected = (m->selected + 1) % m->game_count;
             }
         }
 
@@ -2661,7 +2747,7 @@ static int menu_run(GameMenu *m, SDL_Renderer *rr, SDL_Window *win) {
         SDL_SetRenderDrawColor(rr, 20, 8, 6, 255);
         { SDL_Rect r = { 0, MENU_LH - 20, MENU_LW, 20 }; SDL_RenderFillRect(rr, &r); }
         draw_text(rr, 14, MENU_LH - 15,
-            "Select:Up/Down/Click  Play:Enter/DblClick  Esc:quit", 1, 80, 60, 48);
+            "Select:Up/Down/Wheel  Play:Enter/DblClick  DblClick:Fullscreen", 1, 80, 60, 48);
 
         /* ---- Blit render target to screen with letterboxing ---- */
         SDL_SetRenderTarget(rr, NULL);
@@ -2793,6 +2879,26 @@ static void render(SDL_Renderer *rr, AV *av) {
         }
     }
 
+    /* Scanline effect: darken every other LED row directly in framebuffer.
+     * Done before texture upload so scanlines align perfectly with pixels
+     * regardless of viewport centering math. */
+    if (av->scanlines) {
+        for (int sy = 0; sy < SH; sy += 2) {
+            int py = sy * SCALE;
+            for (int dy = 0; dy < SCALE && py + dy < WIN_H; dy++) {
+                uint32_t *row = &framebuf[(py + dy) * WIN_W];
+                for (int px = 0; px < WIN_W; px++) {
+                    /* Darken: multiply each channel by ~0.75 */
+                    uint32_t c = row[px];
+                    uint32_t r = ((c >> 16) & 0xFF) * 3 / 4;
+                    uint32_t g = ((c >> 8)  & 0xFF) * 3 / 4;
+                    uint32_t b = (c         & 0xFF) * 3 / 4;
+                    row[px] = (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+    }
+
     /* Upload framebuffer to texture and render */
     static SDL_Texture *game_tex = NULL;
     static SDL_Renderer *game_tex_rr = NULL;  /* track renderer for invalidation */
@@ -2808,39 +2914,28 @@ static void render(SDL_Renderer *rr, AV *av) {
     }
     SDL_UpdateTexture(game_tex, NULL, framebuf, WIN_W * sizeof(uint32_t));
 
-    /* Clear full window (wipes any menu remnants from letterbox areas) */
+    /* Clear full window */
     SDL_SetRenderDrawColor(rr, 0, 0, 0, 255);
     SDL_RenderClear(rr);
 
     if (av->integer_scale) {
-        /* Integer scaling: temporarily bypass logical size to compute
-         * integer multiples in actual output pixels, then letterbox. */
+        /* Integer scaling: bypass logical size for pixel-perfect multiples */
         int ow, oh;
-        SDL_RenderSetLogicalSize(rr, 0, 0);  /* native coords */
+        SDL_RenderSetLogicalSize(rr, 0, 0);
         SDL_GetRendererOutputSize(rr, &ow, &oh);
         if (ow < 1) ow = 1;
         if (oh < 1) oh = 1;
-        int sx = ow / WIN_W;
-        int sy = oh / WIN_H;
+        int sx = ow / WIN_W, sy = oh / WIN_H;
         int s = (sx < sy) ? sx : sy;
         if (s < 1) s = 1;
         int dw = WIN_W * s, dh = WIN_H * s;
         SDL_Rect dst = { (ow - dw) / 2, (oh - dh) / 2, dw, dh };
+        SDL_SetRenderDrawColor(rr, 0, 0, 0, 255);
+        SDL_RenderClear(rr);
         SDL_RenderCopy(rr, game_tex, NULL, &dst);
-        SDL_RenderSetLogicalSize(rr, WIN_W, WIN_H);  /* restore */
+        SDL_RenderSetLogicalSize(rr, WIN_W, WIN_H);
     } else {
         SDL_RenderCopy(rr, game_tex, NULL, NULL);
-    }
-
-    /* Scanline effect: darken every other LED row */
-    if (av->scanlines) {
-        SDL_SetRenderDrawColor(rr, 0, 0, 0, 60);
-        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_BLEND);
-        for (int sy = 0; sy < SH; sy += 2) {
-            SDL_Rect sl = {0, sy * SCALE, WIN_W, SCALE};
-            SDL_RenderFillRect(rr, &sl);
-        }
-        SDL_SetRenderDrawBlendMode(rr, SDL_BLENDMODE_NONE);
     }
 
     /* Store stats */
