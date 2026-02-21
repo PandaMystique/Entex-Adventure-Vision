@@ -140,6 +140,41 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 - **CLI sûre** : `atoi` remplacé par `strtol` avec validation complète
 - **Pas de deadlock** : les verrous internes redondants dans `load_state` sont supprimés (l'appelant verrouille)
 
+## Corrections v15.3 (précision émulation hardware)
+
+### Pipeline d'affichage LED (Daniel Boris doc §4.3)
+- **Registres LED matériels** : émulation des 5 registres LED 8 bits du hardware réel. Chaque registre contrôle 8 LEDs (40 au total). L'écriture se fait comme effet de bord de la lecture XRAM (MOVX A,@Rr), exactement comme sur le vrai hardware
+- **Décodage adresse P2.5-P2.7** : sélection des registres LED par les bits 5-7 du port P2 : `100→reg0 (LEDs 1-8)`, `010→reg1 (9-16)`, `110→reg2 (17-24)`, `001→reg3 (25-32)`, `101→reg4 (33-40)`
+- **Strobe P2.4** : front montant de P2.4 = latch des registres LED vers la colonne d'affichage courante. Synchronisation colonne-par-colonne identique au BIOS réel
+- **Compteur de colonnes** : remis à zéro sur le front montant T1 (sync miroir), puis incrémenté par chaque strobe P2.4 — timing cycle-exact
+- **Mode hybride** : si le BIOS utilise les registres LED (P2.4 détecté), ils sont prioritaires. Sinon fallback vers lecture directe XRAM (compatibilité homebrews)
+
+### CPU 8048
+- **Délai post-EI** : l'instruction EI (0x05) impose un délai d'1 instruction avant que les IRQ soient acceptées (comportement hardware MCS-48 documenté)
+- **Dispatch IRQ** : vérification du compteur `ei_delay` avant dispatch — corrige un race condition potentiel entre EI et timer overflow
+
+### Stabilité
+- **P2 tracking** : `prev_p2` sauvegardé pour détection de fronts (P2.4 strobe, protocole son)
+- **État transient** : les registres LED et le compteur de colonnes sont réinitialisés à chaque début de trame
+- **Restauration savestate** : `prev_p2` synchronisé avec P2 CPU après chargement
+
+## Corrections v15.1 (précision émulation)
+
+### CPU 8048
+- **Horloge CPU** : 737280 → 733333 Hz (11 MHz ÷ 15 exact, doc §1.0) — 0.54% plus précis
+- **Cycles/frame** : 49152 → 48889 (division corrigée)
+- **Timer prescaler** : réinitialisé sur `STRT T`, `STRT CNT`, `STOP TCNT` et `MOV T,A` (MCS-48 manual + MAME)
+
+### Son COP411L
+- **Registre de contrôle** : bits 0/3 inversés — bit 0 = fast/slow, bit 3 = loop (doc §6.1-6.2)
+- **Fréquences des tons** : remplacées par les fréquences nominales mesurées sur le hardware (doc §6.2, table Freq Nominal) au lieu du tempérament égal
+- **Durées des segments** : seg1 et seg2 ont des durées distinctes (doc §6.2 : fast=0 → 117ms/240ms, fast=1 → 46ms/104ms)
+- **Protocole son** : machine d'état 4 états, accepte toutes les valeurs de commande y compris $00/$C0 (routine BIOS $03A9)
+
+### Affichage
+- **Scan miroir sync-aware** : les colonnes sont capturées dans une fenêtre de ~2550 cycles après la fin du pulse T1 (front montant), au lieu d'être réparties linéairement sur toute la trame
+- **Mid-frame scan par défaut** : activé par défaut pour plus de précision
+
 ## Corrections v15.2 (audit sécurité)
 
 - **Savestate OOB** (critique) : `cur_step`, `step_count`, `segment` validés après chargement — un `.sav` malveillant ne peut plus provoquer d'accès hors bornes dans `steps[16]`
@@ -156,7 +191,7 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 
 ## Architecture
 
-Émulateur mono-fichier C (~3370 lignes), zéro dépendance externe hors SDL2.
+Émulateur mono-fichier C (~3500 lignes), zéro dépendance externe hors SDL2.
 
 | Module | Lignes | Description |
 |--------|--------|-------------|

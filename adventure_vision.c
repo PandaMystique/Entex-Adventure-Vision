@@ -105,9 +105,9 @@ static char *strcasestr(const char *haystack, const char *needle) {
 #endif
 
 /* ---- Configuration ---- */
-#define CPU_CLK         737280
+#define CPU_CLK         733333  /* 11 MHz / 15 — Daniel Boris doc §1.0 */
 #define FPS             15
-#define CYCLES_PER_FR   (CPU_CLK / FPS)  /* 49152 */
+#define CYCLES_PER_FR   48889  /* 733333 / 15, rounded — real AV timing */
 #define SW              150
 #define SH              40
 #define SCALE           5
@@ -164,6 +164,7 @@ typedef struct {
     bool     t0, t1;            /* T0/T1 test pins */
     uint8_t  P1, P2, BUS;
     bool     irq_en, irq_pend, in_irq;
+    uint8_t  ei_delay;  /* post-EI delay: >0 = skip IRQ dispatch */
     uint8_t  iram[IRAM_SZ];
     uint8_t  irom[IROM_SZ];
     uint8_t  erom[EROM_SZ];
@@ -226,6 +227,11 @@ static inline void xram_wr(I8048 *c, uint8_t addr, uint8_t val) {
     uint16_t full = ((uint16_t)(c->P1 & 0x03) << 8) | addr;
     c->xram[full & (XRAM_SZ-1)] = val;
 }
+
+/* Forward declaration for LED register emulation (defined in display section) */
+static int led_reg_decode(uint8_t p2);
+/* Forward-declared: latch XRAM read data to LED register (AV not yet defined) */
+static void av_led_latch(AV *av, uint8_t p2, uint8_t data);
 
 static int i8048_exec(I8048 *c, AV *sys) {
     uint16_t op_pc = c->PC; /* save for debug before auto-increment */
@@ -334,15 +340,15 @@ static int i8048_exec(I8048 *c, AV *sys) {
     case 0x93:pop_pc_psw(c);c->irq_en=1;c->in_irq=0;cy=2;break; /* RETR */
 
     /* Interrupts & Timer */
-    case 0x05:c->irq_en=1;break;
+    case 0x05:c->irq_en=1;c->ei_delay=1;break; /* EI + 1-instr delay */
     case 0x15:c->irq_en=0;break;
     case 0x25:c->tcnti_en=1;break;
     case 0x35:c->tcnti_en=0;break;
-    case 0x55:c->timer_en=1;c->counter_en=0;break;
-    case 0x45:c->counter_en=1;c->timer_en=0;break;
-    case 0x65:c->timer_en=0;c->counter_en=0;break;
+    case 0x55:c->timer_en=1;c->counter_en=0;c->tpre=0;break;  /* STRT T: start timer, clear prescaler */
+    case 0x45:c->counter_en=1;c->timer_en=0;c->tpre=0;break;  /* STRT CNT: start counter, clear prescaler */
+    case 0x65:c->timer_en=0;c->counter_en=0;c->tpre=0;break;  /* STOP TCNT: stop and clear prescaler */
     case 0x42:c->A=c->timer;break;
-    case 0x62:c->timer=c->A;break;
+    case 0x62:c->timer=c->A;c->tpre=0;break;  /* MOV T,A: load timer + clear prescaler */
 
     /* PSW */
     case 0xC7:bpsw(c);c->A=c->PSW;break;
@@ -362,8 +368,18 @@ static int i8048_exec(I8048 *c, AV *sys) {
     case 0x89:c->P1|=ft(c);av_port_write(sys,1,c->P1);cy=2;break; /* ORL P1,#data */
     case 0x8A:c->P2|=ft(c);av_port_write(sys,2,c->P2);cy=2;break; /* ORL P2,#data */
 
-    /* MOVX — External RAM (banked via P1 bits 0-1) */
-    case 0x80:case 0x81:c->A=xram_rd(c,*R(c,op&1));cy=2;break;
+    /* MOVX A,@Rr — External RAM read (banked via P1 bits 0-1).
+     * Hardware side-effect (§4.3): "The actual write to the LED registers
+     * occurs when there is a read from external memory." The data bus value
+     * is simultaneously latched into the LED register selected by P2.5-P2.7.
+     * This trick allows the BIOS to fill LED regs at max speed. */
+    case 0x80:case 0x81:{
+        uint8_t xval = xram_rd(c, *R(c, op&1));
+        c->A = xval;
+        av_led_latch(sys, c->P2, xval);
+        cy = 2;
+        break;
+    }
     case 0x90:case 0x91:xram_wr(c,*R(c,op&1),c->A);cy=2;break;
 
     /* MOVP */
@@ -398,8 +414,9 @@ static int i8048_exec(I8048 *c, AV *sys) {
         }
     }
 
-    /* IRQ dispatch */
-    if (c->irq_pend && c->irq_en && !c->in_irq) {
+    /* IRQ dispatch — 8048 requires 1 instruction after EI before accepting */
+    if (c->ei_delay > 0) c->ei_delay--;
+    if (c->irq_pend && c->irq_en && !c->in_irq && c->ei_delay == 0) {
         c->irq_pend = false;
         c->in_irq = true;
         c->irq_en = false;
@@ -437,23 +454,26 @@ static int i8048_exec(I8048 *c, AV *sys) {
  */
 
 /* Musical note frequencies for pure tones (equal temperament, A4=440Hz) */
+/* Hardware-measured nominal frequencies from Daniel Boris doc §6.2.
+ * These are the actual COP411L output frequencies at 52.6 kHz RC clock,
+ * NOT equal-temperament approximations. */
 static const float cop411_note_freq[16] = {
-    233.08f,  /* 0: A#3 / Bb3 */
-    246.94f,  /* 1: B3 */
-    261.63f,  /* 2: C4 */
-    277.18f,  /* 3: C#4 / Db4 */
-    293.66f,  /* 4: D4 */
-    311.13f,  /* 5: D#4 / Eb4 */
-    329.63f,  /* 6: E4 */
-    349.23f,  /* 7: F4 */
-    369.99f,  /* 8: F#4 / Gb4 */
-    392.00f,  /* 9: G4 */
-    415.30f,  /* 10: G#4 / Ab4 */
-    440.00f,  /* 11: A4 */
-    466.16f,  /* 12: A#4 / Bb4 */
-    493.88f,  /* 13: B4 */
-    523.25f,  /* 14: C5 */
-    554.37f,  /* 15: C#5 / Db5 */
+    239.23f,  /* 0: ~A#3 */
+    253.03f,  /* 1: ~B3 */
+    268.53f,  /* 2: ~C4 */
+    286.04f,  /* 3: ~C#4 */
+    302.48f,  /* 4: ~D4 */
+    320.92f,  /* 5: ~D#4 */
+    337.38f,  /* 6: ~E4 */
+    360.49f,  /* 7: ~F4 */
+    381.38f,  /* 8: ~F#4 */
+    404.85f,  /* 9: ~G4 */
+    424.44f,  /* 10: ~G#4 */
+    453.72f,  /* 11: ~A4 */
+    478.46f,  /* 12: ~A#4 */
+    506.07f,  /* 13: ~B4 */
+    537.05f,  /* 14: ~C5 */
+    572.08f,  /* 15: ~C#5 */
 };
 
 /* Effect step descriptor: frequency + noise flag + duration (in ms) */
@@ -538,8 +558,9 @@ static void cop411_init(COP411L *snd) {
 
 /* Update volume settings from control register */
 static void cop411_update_ctrl_vol(COP411L *snd) {
-    /* MEGA: bits 1-2 control segment volumes:
-     *   00 = low/low, 01 = high/low, 10 = high/high, 11 = high/high */
+    /* Doc §6.2: bits 1-2 of control register:
+     *   0,0 = low/low  1,0 = high/low  0,1 = high/high  1,1 = high/high
+     *   ctrl_vol = (bit2<<1)|bit1: 0=low/low 1=high/low 2,3=high/high */
     switch (snd->ctrl_vol) {
     case 0: snd->seg1_vol = 0.4f; snd->seg2_vol = 0.4f; break;
     case 1: snd->seg1_vol = 1.0f; snd->seg2_vol = 0.4f; break;
@@ -549,7 +570,7 @@ static void cop411_update_ctrl_vol(COP411L *snd) {
 
 /* Get the speed multiplier from control register */
 static float cop411_speed(const COP411L *snd) {
-    return snd->ctrl_fast ? 0.5f : 1.0f;  /* fast = half duration */
+    return snd->ctrl_fast ? 0.5f : 1.0f;  /* Doc §6.2 bit 0: 1=fast (shorter duration) */
 }
 
 /* Build effect steps for a given command */
@@ -699,14 +720,15 @@ static void cop411_start_tone(COP411L *snd, uint8_t note) {
     snd->cur_freq = freq;
     snd->phase_inc = freq_to_phase_inc(freq);
 
-    /* Two-segment playback */
+    /* Two-segment playback — Doc §6.2: segments have different durations.
+     * Fast=0 (slow): seg1=117ms, seg2=240ms
+     * Fast=1 (fast): seg1=46ms,  seg2=104ms */
     snd->segment = 0;
     cop411_update_ctrl_vol(snd);
     snd->cur_vol = snd->seg1_vol;
 
-    /* Segment duration depends on control fast bit */
-    int base_ms = snd->ctrl_fast ? 150 : 300;
-    snd->seg_samples_total = (base_ms * AUDIO_RATE) / 1000;
+    int seg1_ms = snd->ctrl_fast ? 46 : 117;
+    snd->seg_samples_total = (seg1_ms * AUDIO_RATE) / 1000;
     snd->seg_samples_left = snd->seg_samples_total;
 }
 
@@ -717,9 +739,10 @@ static void cop411_command(COP411L *snd, uint8_t cmd_byte) {
 
     if (cmd == 0x00) {
         /* Control register — persists across resets (in COP411L RAM) */
-        snd->ctrl_loop = data & 0x01;
+        /* Doc §6.1: bit 0 = fast/slow, bits 1-2 = volume, bit 3 = loop */
+        snd->ctrl_fast = data & 0x01;
         snd->ctrl_vol  = (data >> 1) & 0x03;
-        snd->ctrl_fast = (data >> 3) & 0x01;
+        snd->ctrl_loop = (data >> 3) & 0x01;
         cop411_update_ctrl_vol(snd);
         /* Silence current sound */
         snd->active = false;
@@ -807,7 +830,9 @@ static inline float cop411_sample(COP411L *snd) {
                 /* Transition to segment 2 */
                 snd->segment = 1;
                 snd->cur_vol = snd->seg2_vol;
-                snd->seg_samples_left = snd->seg_samples_total;
+                /* Seg2 has its own duration (Doc §6.2) */
+                    { int seg2_ms = snd->ctrl_fast ? 104 : 240;
+                      snd->seg_samples_left = (seg2_ms * AUDIO_RATE) / 1000; }
             } else {
                 /* Tone finished */
                 if (snd->ctrl_loop) {
@@ -840,6 +865,15 @@ typedef struct {
     /* Column snapshot buffer: holds VRAM data at time each column is scanned */
     uint8_t col_data[SW][5];   /* [column][byte 0-4] captured during frame */
     int     cols_captured;     /* how many columns captured this frame */
+
+    /* Hardware LED registers (Daniel Boris doc §4.3):
+     * 5 registers x 8 bits = 40 LEDs. Written as a side-effect of MOVX
+     * reads: when MOVX A,@Rr executes, the data read from XRAM is
+     * simultaneously latched into the LED register selected by P2.5-P2.7.
+     * P2.4 rising edge then strobes the LED data to the display. */
+    uint8_t led_reg[5];     /* LED registers 0-4 (LEDs 1-8 through 33-40) */
+    int     led_col;         /* current column counter (reset on T1 sync) */
+    bool    led_active;      /* true if any P2.4 strobes seen this frame */
 } AVDisp;
 
 /* Capture a column from current VRAM state (called during frame execution) */
@@ -854,6 +888,41 @@ static void disp_capture_column(AVDisp *d, const uint8_t *xram, int col) {
     }
     if (col >= d->cols_captured)
         d->cols_captured = col + 1;
+}
+
+/* Decode P2 bits 5-7 to LED register index per hardware spec (§4.3):
+ * P2.5 P2.6 P2.7 -> Register (LED numbers from top)
+ *   1    0    0  -> 0 (LEDs 1-8)
+ *   0    1    0  -> 1 (LEDs 9-16)
+ *   1    1    0  -> 2 (LEDs 17-24)
+ *   0    0    1  -> 3 (LEDs 25-32)
+ *   1    0    1  -> 4 (LEDs 33-40)
+ *   other        -> -1 (invalid/unused) */
+static int led_reg_decode(uint8_t p2) {
+    uint8_t sel = (p2 >> 5) & 7;
+    switch (sel) {
+    case 4: return 0;  /* 100 */
+    case 2: return 1;  /* 010 */
+    case 6: return 2;  /* 110 */
+    case 1: return 3;  /* 001 */
+    case 5: return 4;  /* 101 */
+    default: return -1; /* 011, 111, 000 = unused */
+    }
+}
+
+/* Latch LED registers to display column (called on P2.4 rising edge).
+ * This is the hardware-accurate display path: the BIOS fills LED registers
+ * via MOVX reads, then strobes P2.4 to advance to the next column. */
+static void disp_latch_led_column(AVDisp *d) {
+    int col = d->led_col;
+    if (col >= 0 && col < SW) {
+        for (int i = 0; i < 5; i++)
+            d->col_data[col][i] = d->led_reg[i];
+        if (col >= d->cols_captured)
+            d->cols_captured = col + 1;
+    }
+    d->led_col++;
+    d->led_active = true;
 }
 
 /* Update display from captured column data (called at end of frame)
@@ -968,13 +1037,33 @@ struct AV {
     uint16_t dbg_run_to;      /* run-to-address (-1 = disabled) */
     uint16_t dbg_watch_addr;  /* XRAM watchpoint addr (-1 = none) */
     bool     dbg_watch_en;
+    /* Display timing: track T1 sync for accurate column capture */
+    int      disp_sync_cycle;   /* cycle when T1 went high (sync end) */
+    bool     disp_sync_seen;    /* true once T1 rising edge detected */
+    /* P2 tracking for hardware display emulation */
+    uint8_t  prev_p2;           /* previous P2 value for edge detection */
 };
+
+/* av_led_latch: called from MOVX read (i8048_exec) to latch data to LED reg.
+ * Must be defined after AV struct is fully visible. */
+static void av_led_latch(AV *av, uint8_t p2, uint8_t data) {
+    int ri = led_reg_decode(p2);
+    if (ri >= 0) av->disp.led_reg[ri] = data;
+}
 
 static void av_port_write(AV *av, uint8_t port, uint8_t val) {
     switch (port) {
     case 0: av->cpu.BUS = val; break;
     case 1: break;
     case 2:
+        /* §4.3: P2.4 rising edge = strobe LED data to display column.
+         * "After all five registers have been written to, the BIOS
+         * sets P2.4 high." This latches LED register contents. */
+        if ((val & 0x10) && !(av->prev_p2 & 0x10)) {
+            disp_latch_led_column(&av->disp);
+        }
+        av->prev_p2 = val;
+
         /* COP411L sound command protocol:
          * CPU writes $C0 to P2 → reset COP411L
          * → delays → sends command high nibble via P2 bits 4-7
@@ -986,10 +1075,17 @@ static void av_port_write(AV *av, uint8_t port, uint8_t val) {
          *
          * Lock audio device around cop411_command to prevent race
          * with the audio callback thread reading COP411L state. */
-        if (val == 0xC0 && av->snd.proto_state == 0) {
+        /* Sound protocol (BIOS routine at $03A9-$03CD):
+         * 1. P2=$C0 → trigger reset latch via MOVX @R0
+         * 2. Wait 33 cycles → release reset via MOVX
+         * 3. P2=cmd_byte → upper nibble to COP411 (bits 4-7 of P2)
+         * 4. P2=SWAP(cmd_byte) → lower nibble to COP411
+         * 5. P2=$00 → clear */
+        if (av->snd.proto_state == 0 && val == 0xC0) {
             av->snd.proto_state = 1;
             av->snd.proto_hi = 0;
-        } else if (av->snd.proto_state == 1 && val != 0x00 && val != 0xC0) {
+        } else if (av->snd.proto_state == 1) {
+            /* Accept ANY value — the BIOS OUTL P2,A with full cmd byte */
             av->snd.proto_hi = (val >> 4) & 0x0F;
             av->snd.proto_state = 2;
         } else if (av->snd.proto_state == 2) {
@@ -1056,6 +1152,12 @@ static void av_init(AV *av) {
     av->cfg_phosphor = DEF_PHOSPHOR;
     av->t1_pulse_start = DEF_T1_START;
     av->t1_pulse_end = DEF_T1_END;
+    av->prev_p2 = 0;
+    av->cpu.ei_delay = 0;
+    memset(av->disp.led_reg, 0xFF, sizeof(av->disp.led_reg));
+    av->disp.led_col = 0;
+    av->disp.led_active = false;
+    av->midframe_scan = true;  /* Default: accurate mid-frame column capture */
     av->dbg_run_to = 0xFFFF;
     av->dbg_watch_addr = 0xFFFF;
     /* Rewind buffer: allocate on first init, reuse afterwards */
@@ -1143,6 +1245,7 @@ static bool rewind_pop(AV *av) {
     av->cpu.F0=(s->flags>>3)&1; av->cpu.F1=(s->flags>>4)&1; av->cpu.BS=(s->flags>>5)&1;
     av->cpu.timer_en=(s->flags>>6)&1; av->cpu.counter_en=(s->flags>>7)&1;
     av->cpu.timer_ovf=s->flags2&1; av->cpu.tcnti_en=(s->flags2>>1)&1;
+    av->prev_p2 = av->cpu.P2; av->cpu.ei_delay = 0;
     av->cpu.irq_en=(s->flags2>>2)&1; av->cpu.irq_pend=(s->flags2>>3)&1;
     av->cpu.in_irq=(s->flags2>>4)&1;
     memcpy(av->cpu.iram, s->iram, IRAM_SZ);
@@ -1323,6 +1426,18 @@ static bool load_file(uint8_t *dest, int max_sz, const char *fn) {
 static void av_run_frame(AV *av) {
     int total = CYCLES_PER_FR;
     int elapsed = 0;
+    av->disp_sync_seen = false;
+    av->disp_sync_cycle = 0;
+    /* Reset LED display state for new frame */
+    memset(av->disp.led_reg, 0xFF, sizeof(av->disp.led_reg));
+    av->disp.led_col = 0;
+    av->disp.led_active = false;
+
+    /* BIOS display routine timing estimate:
+     * After T1 sync (rising edge), BIOS outputs 150 columns.
+     * Per column: P2 setup + 5× MOVX read + P2.4 strobe ≈ 17 cycles.
+     * 150 columns × 17 cycles ≈ 2550 cycles display window. */
+    #define DISP_OUTPUT_CYCLES 2550
 
     while (elapsed < total) {
         if (av->dbg.active) {
@@ -1331,14 +1446,37 @@ static void av_run_frame(AV *av) {
             if (av->dbg.stepping) return;
         }
 
+        bool prev_t1 = av->cpu.t1;
         int cy = i8048_exec(&av->cpu, av);
         elapsed += cy;
 
-        /* Mid-frame column capture: capture column proportional to progress */
-        if (av->midframe_scan) {
-            int col = (elapsed * SW) / total;
-            if (col >= 0 && col < SW)
-                disp_capture_column(&av->disp, av->cpu.xram, col);
+        /* T1 mirror position sensor:
+         * LOW pulse near start of frame to signal BIOS mirror sync.
+         * The BIOS loops on JNT1 waiting for T1=0, then on T1=1 */
+        bool new_t1 = !(elapsed >= av->t1_pulse_start && elapsed < av->t1_pulse_end);
+
+        /* Detect T1 rising edge (low→high = sync pulse ended) */
+        if (!prev_t1 && new_t1 && !av->disp_sync_seen) {
+            av->disp_sync_cycle = elapsed;
+            av->disp_sync_seen = true;
+            /* Reset LED column counter: mirror reached start position.
+             * BIOS will now output 150 columns via LED register + P2.4. */
+            av->disp.led_col = 0;
+        }
+
+        /* Mid-frame column capture — sync-aware:
+         * Columns are captured within the display output window that
+         * starts immediately after T1 sync. Before sync, no columns
+         * are captured (game logic is running, VRAM may be updating). */
+        /* Legacy mid-frame scan: only used when LED register path inactive.
+         * With LED registers, columns are captured via P2.4 strobes instead. */
+        if (av->midframe_scan && !av->disp.led_active && av->disp_sync_seen) {
+            int disp_elapsed = elapsed - av->disp_sync_cycle;
+            if (disp_elapsed >= 0 && disp_elapsed <= DISP_OUTPUT_CYCLES) {
+                int col = (disp_elapsed * SW) / DISP_OUTPUT_CYCLES;
+                if (col >= 0 && col < SW)
+                    disp_capture_column(&av->disp, av->cpu.xram, col);
+            }
         }
 
         /* XRAM watchpoint check */
@@ -1346,15 +1484,10 @@ static void av_run_frame(AV *av) {
             /* Simple: checked after each instruction */
         }
 
-        /* T1 mirror position sensor:
-         * LOW pulse near start of frame to signal BIOS mirror sync.
-         * The BIOS loops on JNT1 waiting for T1=0, then on T1=1 */
-        bool new_t1 = !(elapsed >= av->t1_pulse_start && elapsed < av->t1_pulse_end);
-
         /* Counter mode: increment on T1 falling edge (1→0 transition).
          * MCS-48 datasheet: "Subsequent high to low transitions on T1
          * will cause the counter to increment." */
-        if (av->cpu.counter_en && av->cpu.t1 && !new_t1) {
+        if (av->cpu.counter_en && prev_t1 && !new_t1) {
             if (++av->cpu.timer == 0) {
                 av->cpu.timer_ovf = true;
                 if (av->cpu.tcnti_en && av->cpu.irq_en && !av->cpu.in_irq)
@@ -1364,13 +1497,14 @@ static void av_run_frame(AV *av) {
         av->cpu.t1 = new_t1;
     }
 
-    /* Column capture: end-of-frame (default) or mid-frame (accuracy test).
-     * Mid-frame mode shows what the real mirror would see as it sweeps. */
-    if (!av->midframe_scan) {
+    /* Column capture — hybrid strategy:
+     * If LED columns were captured via P2.4 strobes (hardware-accurate),
+     * they are already in col_data[]. If not (homebrew without BIOS display
+     * routine), fall back to reading XRAM directly. */
+    if (!av->disp.led_active && !av->midframe_scan) {
         for (int col = 0; col < SW; col++)
             disp_capture_column(&av->disp, av->cpu.xram, col);
     }
-    /* (mid-frame columns captured inline during execution above) */
 
     /* Update display from captured columns */
     disp_update(&av->disp, av->cfg_phosphor);
@@ -1673,8 +1807,8 @@ static int run_self_test(void) {
     /* Test 8: COP411L tone command */
     {
         COP411L s; cop411_init(&s);
-        cop411_command(&s, 0xE5); /* note 5 = D#4 */
-        if (s.active && !s.is_noise && s.cur_freq > 310.0f && s.cur_freq < 312.0f) pass++;
+        cop411_command(&s, 0xE5); /* note 5 = ~D#4 (hardware: 320.92 Hz) */
+        if (s.active && !s.is_noise && s.cur_freq > 319.0f && s.cur_freq < 322.0f) pass++;
         else { fail++; printf("FAIL: tone E5 freq=%.1f active=%d\n", s.cur_freq, s.active); }
     }
 
