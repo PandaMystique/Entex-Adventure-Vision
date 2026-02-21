@@ -159,6 +159,27 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 - **PSW bit 3 = 1** : bit 3 forcé à 1 lors de toute lecture. Doc : "Bit 3 of the PSW is unused and is always set to one."
 - **PC bit 11 = 0 pendant ISR** : `JMP`/`CALL` en ISR ne peuvent plus activer le bit 11 (memory bank). Doc : "During servicing of an interrupt, PC bit 11 is held at zero."
 
+### Audit de sécurité et robustesse #3
+
+#### Concurrence audio (thread safety)
+- **Volume/profil audio** : les touches +/−/F4 utilisent maintenant `AUDIO_LOCK` pour synchroniser l'accès à `snd_volume` et `audio_profile` avec le fil audio SDL.
+- **WAV flush thread-safe** : nouvelle fonction `wav_flush_safe()` utilisant le pattern copie-sous-verrou : snapshot du ring buffer sous `AUDIO_LOCK`, écriture disque hors verrou. Élimine la condition de compétition sans risquer de coupures audio.
+- **Suppression de `volatile`** : `snd_volume` et `ring_wr` ne dépendent plus de `volatile` (insuffisant pour la synchronisation inter-fils), remplacés par une protection systématique via `AUDIO_LOCK`.
+
+#### Portabilité binaire
+- **WAV little-endian** : fonctions `wav_le16()`/`wav_le32()` pour écriture explicite LE dans l'en-tête et la finalisation WAV. Corrige les fichiers invalides sur architecture big-endian.
+- **Savestate steps** : sérialisation champ-par-champ de `SndStep` (float freq, bool noise, int dur_ms, float volume) au lieu de `fwrite` de structure brute. Élimine les problèmes de padding/alignement entre compilateurs. SAVE_VER → 19.
+- **Fichier temp portable** : le self-test utilise `av_test_tmp.sav` au lieu de `/tmp/av_test.sav`.
+
+#### Robustesse
+- **`load_file()` nettoie le buffer** : `memset(0xFF)` avant lecture, évite les données résiduelles si un ROM plus court est chargé après un plus long.
+- **Config T1 : validation différée** : la vérification `t1_pulse_start < t1_pulse_end` est maintenant effectuée après lecture complète du fichier INI (évite une fausse alerte si les valeurs apparaissent dans un ordre quelconque).
+
+#### Hygiène compilation
+- **`<strings.h>`** inclus pour `strcasecmp` sur POSIX.
+- **`isfinite` MSVC** : alias vers `_finite` pour compatibilité MSVC.
+- **Zéro warning `-Wshadow`** confirmé.
+
 ### Tests
 - **8 nouveaux tests** (12–19) : PSW bit 3, DIS TCNTI, timer overflow latch (irq_en=0 et ISR), JMP en ISR, décodage LED complet. Total : **19 tests**.
 
@@ -203,7 +224,7 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 
 - **Savestate OOB** (critique) : `cur_step`, `step_count`, `segment` validés après chargement — un `.sav` malveillant ne peut plus provoquer d'accès hors bornes dans `steps[16]`
 - **Savestate NaN/Inf** : `cur_freq`, `cur_vol`, `seg1_vol`, `seg2_vol` et toutes les fréquences/volumes des steps rejetés si non finis
-- **Savestate portabilité** : `sizeof(bool)` et `sizeof(int)` remplacés par types à largeur fixe (`uint8_t`, `int32_t`) — format SAVE_VER 18
+- **Savestate portabilité** : `sizeof(bool)` et `sizeof(int)` remplacés par types à largeur fixe (`uint8_t`, `int32_t`). Steps sérialisés champ-par-champ depuis SAVE_VER 19
 - **Garde OOB runtime** : `cop411_sample()` vérifie `cur_step < MAX_SND_STEPS` même en fonctionnement normal (défense en profondeur)
 - **CLI `--volume`** : n'est plus écrasé silencieusement par `advision.ini` (appliqué après `config_load`)
 - **Integer scaling** : le flag F6 fonctionne réellement — calcul en pixels natifs, letterbox centré, restauration du mode logique
@@ -215,7 +236,7 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 
 ## Architecture
 
-Émulateur mono-fichier C (~3580 lignes), zéro dépendance externe hors SDL2.
+Émulateur mono-fichier C (~3650 lignes), zéro dépendance externe hors SDL2.
 
 | Module | Lignes | Description |
 |--------|--------|-------------|

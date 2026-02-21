@@ -58,6 +58,14 @@
 #include <ctype.h>
 #include <time.h>
 #include <errno.h>
+#ifndef _MSC_VER
+#include <strings.h>  /* strcasecmp on POSIX */
+#endif
+
+/* MSVC isfinite compat */
+#if defined(_MSC_VER) && !defined(isfinite)
+#define isfinite _finite
+#endif
 
 /* Portable strcasestr for MSVC and other non-GNU systems */
 #if defined(_MSC_VER) || !defined(__GLIBC__)
@@ -988,7 +996,7 @@ typedef struct {
     bool active;
     /* Ring buffer: audio thread writes, main thread flushes */
     int16_t ring[WAV_RING_SZ];
-    volatile uint32_t ring_wr;  /* written by audio thread */
+    uint32_t ring_wr;            /* written by audio thread, read under AUDIO_LOCK */
     uint32_t ring_rd;           /* read by main thread */
 } WavWriter;
 
@@ -997,7 +1005,7 @@ struct AV {
     AVDisp  disp;
     COP411L snd;
     struct { bool u,d,l,r,b1,b2,b3,b4; } input;
-    volatile int snd_volume;    /* 0-10, default 7 */
+    int snd_volume;             /* 0-10, default 7 — access under AUDIO_LOCK */
     uint32_t adev;              /* SDL audio device ID for thread-safe locking */
     struct { bool active, stepping; uint16_t bp[MAX_BP]; int bp_count; } dbg;
     bool running;
@@ -1258,20 +1266,23 @@ static bool rewind_pop(AV *av) {
 }
 
 /* ---- WAV recording ---- */
+/* Write uint16/uint32 in little-endian (WAV format requires LE) */
+static void wav_le16(uint8_t *p, uint16_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; }
+static void wav_le32(uint8_t *p, uint32_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF; }
+
 static void wav_start(WavWriter *w, const char *fn) {
     w->fp = fopen(fn, "wb");
     if (!w->fp) return;
-    /* Write placeholder header (44 bytes), update on close */
+    /* Write placeholder header (44 bytes) in explicit LE */
     uint8_t hdr[44] = {0};
     memcpy(hdr, "RIFF", 4); memcpy(hdr+8, "WAVEfmt ", 8);
-    uint32_t v;
-    v = 16; memcpy(hdr+16, &v, 4);      /* chunk size */
-    uint16_t fmt = 1; memcpy(hdr+20, &fmt, 2); /* PCM */
-    fmt = 1; memcpy(hdr+22, &fmt, 2);   /* mono */
-    v = AUDIO_RATE; memcpy(hdr+24, &v, 4); /* sample rate */
-    v = AUDIO_RATE * 2; memcpy(hdr+28, &v, 4); /* byte rate */
-    fmt = 2; memcpy(hdr+32, &fmt, 2);   /* block align */
-    fmt = 16; memcpy(hdr+34, &fmt, 2);  /* bits/sample */
+    wav_le32(hdr+16, 16);                   /* chunk size */
+    wav_le16(hdr+20, 1);                    /* PCM */
+    wav_le16(hdr+22, 1);                    /* mono */
+    wav_le32(hdr+24, AUDIO_RATE);            /* sample rate */
+    wav_le32(hdr+28, AUDIO_RATE * 2);        /* byte rate */
+    wav_le16(hdr+32, 2);                    /* block align */
+    wav_le16(hdr+34, 16);                   /* bits/sample */
     memcpy(hdr+36, "data", 4);
     fwrite(hdr, 44, 1, w->fp);
     w->samples_written = 0;
@@ -1280,29 +1291,18 @@ static void wav_start(WavWriter *w, const char *fn) {
     w->active = true;
 }
 
-/* Flush ring buffer to disk — called from main thread only.
- * Writes contiguous segments in bulk for I/O efficiency. */
+/* Flush ring buffer to disk — non-locked version for shutdown/headless. */
 static void wav_flush(WavWriter *w) {
     if (!w->fp) return;
     uint32_t rd = w->ring_rd;
-    uint32_t wr = w->ring_wr;  /* snapshot (audio thread is single writer) */
+    uint32_t wr = w->ring_wr;
     if (rd == wr) return;
-    /* Detect overflow: if distance > ring size, we lost samples */
-    if ((wr - rd) > WAV_RING_SZ) {
-        fprintf(stderr, "[WAV] Ring buffer overflow, %u samples lost\n",
-                (wr - rd) - WAV_RING_SZ);
-        rd = wr - WAV_RING_SZ;  /* skip to oldest available */
-    }
-    /* Write in up to 2 contiguous segments (ring wrap) */
+    if ((wr - rd) > WAV_RING_SZ) rd = wr - WAV_RING_SZ;
     while (rd != wr) {
         uint32_t start = rd & (WAV_RING_SZ - 1);
-        uint32_t end_idx = wr & (WAV_RING_SZ - 1);
-        uint32_t chunk;
-        if (start < end_idx || (wr - rd) >= WAV_RING_SZ)
-            chunk = (wr - rd) < (WAV_RING_SZ - start) ? (wr - rd) : (WAV_RING_SZ - start);
-        else
-            chunk = WAV_RING_SZ - start;
-        if (chunk > (wr - rd)) chunk = wr - rd;
+        uint32_t chunk = wr - rd;
+        uint32_t to_end = WAV_RING_SZ - start;
+        if (chunk > to_end) chunk = to_end;
         fwrite(&w->ring[start], sizeof(int16_t), chunk, w->fp);
         w->samples_written += chunk;
         rd += chunk;
@@ -1310,14 +1310,43 @@ static void wav_flush(WavWriter *w) {
     w->ring_rd = rd;
 }
 
+#ifdef USE_SDL
+/* Thread-safe flush: copy ring under audio lock, write to disk outside lock.
+ * Prevents audio glitches from disk I/O blocking the audio callback. */
+static void wav_flush_safe(AV *av, WavWriter *w) {
+    if (!w->fp) return;
+    int16_t tmp[WAV_RING_SZ];
+    uint32_t rd, wr, avail;
+
+    AUDIO_LOCK(av);
+    rd = w->ring_rd;
+    wr = w->ring_wr;
+    if (rd == wr) { AUDIO_UNLOCK(av); return; }
+    if ((wr - rd) > WAV_RING_SZ) {
+        fprintf(stderr, "[WAV] Ring buffer overflow, %u samples lost\n",
+                (wr - rd) - WAV_RING_SZ);
+        rd = wr - WAV_RING_SZ;
+    }
+    avail = wr - rd;
+    if (avail > WAV_RING_SZ) avail = WAV_RING_SZ;
+    for (uint32_t i = 0; i < avail; i++)
+        tmp[i] = w->ring[(rd + i) & (WAV_RING_SZ - 1)];
+    w->ring_rd = rd + avail;
+    AUDIO_UNLOCK(av);
+
+    size_t n = fwrite(tmp, sizeof(int16_t), avail, w->fp);
+    w->samples_written += (uint32_t)n;
+}
+#endif
+
 static void wav_stop(WavWriter *w) {
     if (!w->fp) return;
-    /* Flush any remaining samples from the ring buffer */
-    wav_flush(w);
+    wav_flush(w);  /* flush remaining (non-locked fallback for shutdown) */
     uint32_t data_sz = w->samples_written * 2;
     uint32_t riff_sz = data_sz + 36;
-    fseek(w->fp, 4, SEEK_SET); fwrite(&riff_sz, 4, 1, w->fp);
-    fseek(w->fp, 40, SEEK_SET); fwrite(&data_sz, 4, 1, w->fp);
+    uint8_t le4[4];
+    wav_le32(le4, riff_sz); fseek(w->fp, 4, SEEK_SET); fwrite(le4, 4, 1, w->fp);
+    wav_le32(le4, data_sz); fseek(w->fp, 40, SEEK_SET); fwrite(le4, 4, 1, w->fp);
     fclose(w->fp);
     w->fp = NULL; w->active = false;
 }
@@ -1388,15 +1417,15 @@ static void config_load(AV *av, bool *fullscreen) {
             av->t1_pulse_start = v;
         if (sscanf(line, "t1_pulse_end=%d", &v) == 1 && v >= 0 && v < 2000)
             av->t1_pulse_end = v;
-        /* Validate T1 pulse: start must be < end to produce a valid pulse.
-         * If inverted, the BIOS JNT1 loop never exits → infinite hang. */
-        if (av->t1_pulse_start >= av->t1_pulse_end) {
-            fprintf(stderr, "Warning: t1_pulse_start >= t1_pulse_end, using defaults\n");
-            av->t1_pulse_start = DEF_T1_START;
-            av->t1_pulse_end = DEF_T1_END;
-        }
     }
     fclose(f);
+    /* Validate T1 pulse AFTER all lines read (both values now final).
+     * start must be < end or BIOS JNT1 loop hangs. */
+    if (av->t1_pulse_start >= av->t1_pulse_end) {
+        fprintf(stderr, "Warning: t1_pulse_start >= t1_pulse_end, using defaults\n");
+        av->t1_pulse_start = DEF_T1_START;
+        av->t1_pulse_end = DEF_T1_END;
+    }
 }
 
 static bool load_file(uint8_t *dest, int max_sz, const char *fn) {
@@ -1410,6 +1439,9 @@ static bool load_file(uint8_t *dest, int max_sz, const char *fn) {
         fprintf(stderr, "Warning: '%s' is %ld bytes, truncating to %d\n", fn, file_sz, max_sz);
         file_sz = max_sz;
     }
+    /* Clear buffer before reading — prevents stale data if loading a
+     * shorter ROM after a longer one (non-determinism source). */
+    memset(dest, 0xFF, (size_t)max_sz);
     fseek(f, 0, SEEK_SET);
     size_t n = fread(dest, 1, (size_t)file_sz, f);
     fclose(f);
@@ -1520,7 +1552,7 @@ static void av_run_frame(AV *av) {
 
 /* ---- Save/Load with validation ---- */
 #define SAVE_MAGIC  0x41563133  /* "AV13" */
-#define SAVE_VER    18
+#define SAVE_VER    19  /* v15.4: field-by-field steps serialization */
 
 static bool save_state(const AV *av, const char *fn) {
     FILE *f = fopen(fn, "wb");
@@ -1575,7 +1607,15 @@ static bool save_state(const AV *av, const char *fn) {
       i32 = (int32_t)av->snd.seg_samples_total;  ok = ok && fwrite(&i32, 4, 1, f) == 1; }
     ok = ok && fwrite(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
     ok = ok && fwrite(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
-    ok = ok && fwrite(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
+    /* Write steps field-by-field for portability (no struct padding/endian issues) */
+    for (int si = 0; si < MAX_SND_STEPS; si++) {
+        ok = ok && fwrite(&av->snd.steps[si].freq, sizeof(float), 1, f) == 1;
+        { uint8_t bn = av->snd.steps[si].noise ? 1 : 0;
+          ok = ok && fwrite(&bn, 1, 1, f) == 1; }
+        { int32_t di = (int32_t)av->snd.steps[si].dur_ms;
+          ok = ok && fwrite(&di, 4, 1, f) == 1; }
+        ok = ok && fwrite(&av->snd.steps[si].volume, sizeof(float), 1, f) == 1;
+    }
     fclose(f);
     if (ok) printf("State saved.\n");
     else fprintf(stderr, "Write error saving state\n");
@@ -1642,7 +1682,15 @@ static bool load_state(AV *av, const char *fn) {
       ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.seg_samples_total = (int)i32; }
     ok = ok && fread(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
     ok = ok && fread(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
-    ok = ok && fread(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
+    /* Read steps field-by-field (matches field-by-field write) */
+    for (int si = 0; si < MAX_SND_STEPS; si++) {
+        ok = ok && fread(&av->snd.steps[si].freq, sizeof(float), 1, f) == 1;
+        { uint8_t bn; ok = ok && fread(&bn, 1, 1, f) == 1;
+          av->snd.steps[si].noise = (bn != 0); }
+        { int32_t di; ok = ok && fread(&di, 4, 1, f) == 1;
+          av->snd.steps[si].dur_ms = (int)di; }
+        ok = ok && fread(&av->snd.steps[si].volume, sizeof(float), 1, f) == 1;
+    }
     fclose(f);
 
     if (!ok) {
@@ -1835,12 +1883,12 @@ static int run_self_test(void) {
         av1.cpu.A = 0xAB; av1.cpu.PC = 0x123; av1.cpu.timer = 0x55;
         av1.snd.lfsr = 0x1234;
         av1.snd.active = true; av1.snd.cur_freq = 440.0f;
-        save_state(&av1, "/tmp/av_test.sav");
-        load_state(&av2, "/tmp/av_test.sav");
+        save_state(&av1, "av_test_tmp.sav");
+        load_state(&av2, "av_test_tmp.sav");
         if (av2.cpu.A == 0xAB && av2.cpu.PC == 0x123 && av2.snd.lfsr == 0x1234
             && av2.snd.active && av2.snd.cur_freq > 439.0f) pass++;
         else { fail++; printf("FAIL: savestate round-trip\n"); }
-        remove("/tmp/av_test.sav");
+        remove("av_test_tmp.sav");
         if (av1.rewind_buf) free(av1.rewind_buf);
         if (av2.rewind_buf) free(av2.rewind_buf);
     }
@@ -3275,16 +3323,22 @@ int main(int argc, char **argv) {
                         if (p) { av_reset(&av); osd_show(&av, "Reset"); }
                         break;
                     case SDLK_PLUS: case SDLK_EQUALS: case SDLK_KP_PLUS:
-                        if (p && av.snd_volume < 10) {
-                            av.snd_volume++;
-                            char buf[32]; snprintf(buf, 32, "Volume: %d", av.snd_volume);
+                        if (p) {
+                            AUDIO_LOCK(&av);
+                            if (av.snd_volume < 10) av.snd_volume++;
+                            int v_ = av.snd_volume;
+                            AUDIO_UNLOCK(&av);
+                            char buf[32]; snprintf(buf, 32, "Volume: %d", v_);
                             osd_show(&av, buf);
                         }
                         break;
                     case SDLK_MINUS: case SDLK_KP_MINUS:
-                        if (p && av.snd_volume > 0) {
-                            av.snd_volume--;
-                            char buf[32]; snprintf(buf, 32, "Volume: %d", av.snd_volume);
+                        if (p) {
+                            AUDIO_LOCK(&av);
+                            if (av.snd_volume > 0) av.snd_volume--;
+                            int v_ = av.snd_volume;
+                            AUDIO_UNLOCK(&av);
+                            char buf[32]; snprintf(buf, 32, "Volume: %d", v_);
                             osd_show(&av, buf);
                         }
                         break;
@@ -3328,8 +3382,11 @@ int main(int argc, char **argv) {
                         break;
                     case SDLK_F4:
                         if(p) {
+                            AUDIO_LOCK(&av);
                             av.audio_profile = (av.audio_profile + 1) % AUDIO_PROFILES;
-                            char apb[48]; snprintf(apb, 48, "Audio: %s", audio_profile_names[av.audio_profile]);
+                            int ap_ = av.audio_profile;
+                            AUDIO_UNLOCK(&av);
+                            char apb[48]; snprintf(apb, 48, "Audio: %s", audio_profile_names[ap_]);
                             osd_show(&av, apb);
                         }
                         break;
@@ -3476,7 +3533,7 @@ int main(int argc, char **argv) {
             render(rr, &av);
 
             /* Flush WAV ring buffer to disk (main thread only) */
-            if (av.wav.fp) wav_flush(&av.wav);
+            if (av.wav.fp) wav_flush_safe(&av, &av.wav);
 
             /* Frame timing + FPS measurement */
             {
