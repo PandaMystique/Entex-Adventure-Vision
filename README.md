@@ -51,6 +51,7 @@
 | **Super Cobra** | 1982 | Shoot horizontal | Z:tir X:bombe |
 | **Space Force** | 1982 | Tir fixe | Z:tir |
 | **Turtles** | 1982 | Labyrinthe | Flèches Z:boîte |
+| **Table Tennis** | 1982 | Sport/Pong | ↑↓:raquette Z:service |
 
 ## Compilation
 
@@ -139,9 +140,23 @@ Tests couverts : MOV A, ADD carry, JMP, DJNZ loop, DAA (BCD), timer prescaler/ov
 - **CLI sûre** : `atoi` remplacé par `strtol` avec validation complète
 - **Pas de deadlock** : les verrous internes redondants dans `load_state` sont supprimés (l'appelant verrouille)
 
+## Corrections v15.2 (audit sécurité)
+
+- **Savestate OOB** (critique) : `cur_step`, `step_count`, `segment` validés après chargement — un `.sav` malveillant ne peut plus provoquer d'accès hors bornes dans `steps[16]`
+- **Savestate NaN/Inf** : `cur_freq`, `cur_vol`, `seg1_vol`, `seg2_vol` et toutes les fréquences/volumes des steps rejetés si non finis
+- **Savestate portabilité** : `sizeof(bool)` et `sizeof(int)` remplacés par types à largeur fixe (`uint8_t`, `int32_t`) — format SAVE_VER 18
+- **Garde OOB runtime** : `cop411_sample()` vérifie `cur_step < MAX_SND_STEPS` même en fonctionnement normal (défense en profondeur)
+- **CLI `--volume`** : n'est plus écrasé silencieusement par `advision.ini` (appliqué après `config_load`)
+- **Integer scaling** : le flag F6 fonctionne réellement — calcul en pixels natifs, letterbox centré, restauration du mode logique
+- **Texture statique** : suivi du renderer pour invalidation si le contexte GPU change ; fuite mémoire éliminée
+- **LUT gamma** : `powf()` éliminé de la boucle chaude render (table 256 entrées, recalculée uniquement si gamma change)
+- **WAV batch writes** : `wav_flush` écrit par segments contigus au lieu de sample-par-sample ; détection d'overflow ring buffer
+- **T1 pulse** : `t1_pulse_start >= t1_pulse_end` rejeté → plus de boucle infinie BIOS
+- **Config INI** : `gamma` et `phosphor` rejettent `NaN`/`Inf` via `isfinite()`
+
 ## Architecture
 
-Émulateur mono-fichier C (~3270 lignes), zéro dépendance externe hors SDL2.
+Émulateur mono-fichier C (~3370 lignes), zéro dépendance externe hors SDL2.
 
 | Module | Lignes | Description |
 |--------|--------|-------------|

@@ -787,7 +787,10 @@ static inline float cop411_sample(COP411L *snd) {
                     return out;
                 }
             }
-            /* Load new step */
+            /* Load new step (bounds check: defensive against corruption) */
+            if (snd->cur_step < 0 || snd->cur_step >= MAX_SND_STEPS) {
+                snd->active = false; return out;
+            }
             SndStep *s = &snd->steps[snd->cur_step];
             snd->cur_freq = s->freq;
             snd->is_noise = s->noise;
@@ -1175,16 +1178,32 @@ static void wav_start(WavWriter *w, const char *fn) {
     w->active = true;
 }
 
-/* Flush ring buffer to disk — called from main thread only */
+/* Flush ring buffer to disk — called from main thread only.
+ * Writes contiguous segments in bulk for I/O efficiency. */
 static void wav_flush(WavWriter *w) {
-    if (!w->fp || !w->active) return;
+    if (!w->fp) return;
     uint32_t rd = w->ring_rd;
-    uint32_t wr = w->ring_wr;  /* atomic read (single-writer) */
+    uint32_t wr = w->ring_wr;  /* snapshot (audio thread is single writer) */
+    if (rd == wr) return;
+    /* Detect overflow: if distance > ring size, we lost samples */
+    if ((wr - rd) > WAV_RING_SZ) {
+        fprintf(stderr, "[WAV] Ring buffer overflow, %u samples lost\n",
+                (wr - rd) - WAV_RING_SZ);
+        rd = wr - WAV_RING_SZ;  /* skip to oldest available */
+    }
+    /* Write in up to 2 contiguous segments (ring wrap) */
     while (rd != wr) {
-        int16_t s = w->ring[rd & (WAV_RING_SZ - 1)];
-        fwrite(&s, sizeof(int16_t), 1, w->fp);
-        w->samples_written++;
-        rd++;
+        uint32_t start = rd & (WAV_RING_SZ - 1);
+        uint32_t end_idx = wr & (WAV_RING_SZ - 1);
+        uint32_t chunk;
+        if (start < end_idx || (wr - rd) >= WAV_RING_SZ)
+            chunk = (wr - rd) < (WAV_RING_SZ - start) ? (wr - rd) : (WAV_RING_SZ - start);
+        else
+            chunk = WAV_RING_SZ - start;
+        if (chunk > (wr - rd)) chunk = wr - rd;
+        fwrite(&w->ring[start], sizeof(int16_t), chunk, w->fp);
+        w->samples_written += chunk;
+        rd += chunk;
     }
     w->ring_rd = rd;
 }
@@ -1255,9 +1274,9 @@ static void config_load(AV *av, bool *fullscreen) {
             av->cfg_scale = v;
         if (sscanf(line, "audio_profile=%d", &v) == 1 && v >= 0 && v < AUDIO_PROFILES)
             av->audio_profile = v;
-        if (sscanf(line, "gamma=%f", &fv) == 1 && fv >= 0.2f && fv <= 3.0f)
+        if (sscanf(line, "gamma=%f", &fv) == 1 && isfinite(fv) && fv >= 0.2f && fv <= 3.0f)
             av->cfg_gamma = fv;
-        if (sscanf(line, "phosphor=%f", &fv) == 1 && fv >= 0.0f && fv <= 1.0f)
+        if (sscanf(line, "phosphor=%f", &fv) == 1 && isfinite(fv) && fv >= 0.0f && fv <= 1.0f)
             av->cfg_phosphor = fv;
         if (sscanf(line, "scanlines=%d", &v) == 1)
             av->scanlines = (v != 0);
@@ -1267,6 +1286,13 @@ static void config_load(AV *av, bool *fullscreen) {
             av->t1_pulse_start = v;
         if (sscanf(line, "t1_pulse_end=%d", &v) == 1 && v >= 0 && v < 2000)
             av->t1_pulse_end = v;
+        /* Validate T1 pulse: start must be < end to produce a valid pulse.
+         * If inverted, the BIOS JNT1 loop never exits → infinite hang. */
+        if (av->t1_pulse_start >= av->t1_pulse_end) {
+            fprintf(stderr, "Warning: t1_pulse_start >= t1_pulse_end, using defaults\n");
+            av->t1_pulse_start = DEF_T1_START;
+            av->t1_pulse_end = DEF_T1_END;
+        }
     }
     fclose(f);
 }
@@ -1361,7 +1387,7 @@ static void av_run_frame(AV *av) {
 
 /* ---- Save/Load with validation ---- */
 #define SAVE_MAGIC  0x41563133  /* "AV13" */
-#define SAVE_VER    17
+#define SAVE_VER    18
 
 static bool save_state(const AV *av, const char *fn) {
     FILE *f = fopen(fn, "wb");
@@ -1398,20 +1424,22 @@ static bool save_state(const AV *av, const char *fn) {
     ok = ok && fwrite(&av->snd.proto_state, 1, 1, f) == 1;
     ok = ok && fwrite(&av->snd.proto_hi, 1, 1, f) == 1;
     ok = ok && fwrite(&av->snd.lfsr, sizeof(uint16_t), 1, f) == 1;
-    /* v15: full COP411L playback state */
-    ok = ok && fwrite(&av->snd.active, sizeof(bool), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.is_noise, sizeof(bool), 1, f) == 1;
+    /* v15: full COP411L playback state (fixed-width for cross-platform portability) */
+    { uint8_t b;
+      b = av->snd.active ? 1 : 0;   ok = ok && fwrite(&b, 1, 1, f) == 1;
+      b = av->snd.is_noise ? 1 : 0;  ok = ok && fwrite(&b, 1, 1, f) == 1; }
     ok = ok && fwrite(&av->snd.command, 1, 1, f) == 1;
     ok = ok && fwrite(&av->snd.cur_freq, sizeof(float), 1, f) == 1;
     ok = ok && fwrite(&av->snd.cur_vol, sizeof(float), 1, f) == 1;
     ok = ok && fwrite(&av->snd.phase_acc, sizeof(uint32_t), 1, f) == 1;
     ok = ok && fwrite(&av->snd.phase_inc, sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.cur_step, sizeof(int), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.step_count, sizeof(int), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.step_samples_left, sizeof(int), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.segment, sizeof(int), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.seg_samples_left, sizeof(int), 1, f) == 1;
-    ok = ok && fwrite(&av->snd.seg_samples_total, sizeof(int), 1, f) == 1;
+    { int32_t i32;
+      i32 = (int32_t)av->snd.cur_step;          ok = ok && fwrite(&i32, 4, 1, f) == 1;
+      i32 = (int32_t)av->snd.step_count;         ok = ok && fwrite(&i32, 4, 1, f) == 1;
+      i32 = (int32_t)av->snd.step_samples_left;  ok = ok && fwrite(&i32, 4, 1, f) == 1;
+      i32 = (int32_t)av->snd.segment;             ok = ok && fwrite(&i32, 4, 1, f) == 1;
+      i32 = (int32_t)av->snd.seg_samples_left;   ok = ok && fwrite(&i32, 4, 1, f) == 1;
+      i32 = (int32_t)av->snd.seg_samples_total;  ok = ok && fwrite(&i32, 4, 1, f) == 1; }
     ok = ok && fwrite(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
     ok = ok && fwrite(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
     ok = ok && fwrite(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
@@ -1463,20 +1491,22 @@ static bool load_state(AV *av, const char *fn) {
     ok = ok && fread(&av->snd.proto_state, 1, 1, f) == 1;
     ok = ok && fread(&av->snd.proto_hi, 1, 1, f) == 1;
     ok = ok && fread(&av->snd.lfsr, sizeof(uint16_t), 1, f) == 1;
-    /* v15: full COP411L playback state */
-    ok = ok && fread(&av->snd.active, sizeof(bool), 1, f) == 1;
-    ok = ok && fread(&av->snd.is_noise, sizeof(bool), 1, f) == 1;
+    /* v15: full COP411L playback state (fixed-width for cross-platform portability) */
+    { uint8_t b;
+      ok = ok && fread(&b, 1, 1, f) == 1; av->snd.active = (b != 0);
+      ok = ok && fread(&b, 1, 1, f) == 1; av->snd.is_noise = (b != 0); }
     ok = ok && fread(&av->snd.command, 1, 1, f) == 1;
     ok = ok && fread(&av->snd.cur_freq, sizeof(float), 1, f) == 1;
     ok = ok && fread(&av->snd.cur_vol, sizeof(float), 1, f) == 1;
     ok = ok && fread(&av->snd.phase_acc, sizeof(uint32_t), 1, f) == 1;
     ok = ok && fread(&av->snd.phase_inc, sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&av->snd.cur_step, sizeof(int), 1, f) == 1;
-    ok = ok && fread(&av->snd.step_count, sizeof(int), 1, f) == 1;
-    ok = ok && fread(&av->snd.step_samples_left, sizeof(int), 1, f) == 1;
-    ok = ok && fread(&av->snd.segment, sizeof(int), 1, f) == 1;
-    ok = ok && fread(&av->snd.seg_samples_left, sizeof(int), 1, f) == 1;
-    ok = ok && fread(&av->snd.seg_samples_total, sizeof(int), 1, f) == 1;
+    { int32_t i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.cur_step = (int)i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.step_count = (int)i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.step_samples_left = (int)i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.segment = (int)i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.seg_samples_left = (int)i32;
+      ok = ok && fread(&i32, 4, 1, f) == 1; av->snd.seg_samples_total = (int)i32; }
     ok = ok && fread(&av->snd.seg1_vol, sizeof(float), 1, f) == 1;
     ok = ok && fread(&av->snd.seg2_vol, sizeof(float), 1, f) == 1;
     ok = ok && fread(av->snd.steps, sizeof(SndStep), MAX_SND_STEPS, f) == MAX_SND_STEPS;
@@ -1512,6 +1542,33 @@ static bool load_state(AV *av, const char *fn) {
     av->snd.ctrl_fast &= 1;
     if (av->snd.proto_state > 3) av->snd.proto_state = 0;
     av->snd.proto_hi &= 0x0F;
+    /* Sanitize COP411L playback fields — prevent OOB from crafted saves */
+    if (av->snd.step_count < 0 || av->snd.step_count > MAX_SND_STEPS)
+        av->snd.step_count = 0;
+    if (av->snd.cur_step < 0 || av->snd.cur_step >= av->snd.step_count)
+        av->snd.cur_step = 0;
+    if (av->snd.segment < 0 || av->snd.segment > 1)
+        av->snd.segment = 0;
+    if (av->snd.step_samples_left < 0) av->snd.step_samples_left = 0;
+    if (av->snd.seg_samples_left < 0) av->snd.seg_samples_left = 0;
+    if (av->snd.seg_samples_total < 0) av->snd.seg_samples_total = 0;
+    /* Reject NaN/Inf floats (isfinite returns 0 for NaN and Inf) */
+    if (!isfinite(av->snd.cur_freq) || av->snd.cur_freq < 0.0f)
+        av->snd.cur_freq = 0.0f;
+    if (!isfinite(av->snd.cur_vol) || av->snd.cur_vol < 0.0f)
+        av->snd.cur_vol = 0.0f;
+    if (av->snd.cur_vol > 2.0f) av->snd.cur_vol = 1.0f;
+    if (!isfinite(av->snd.seg1_vol)) av->snd.seg1_vol = 1.0f;
+    if (!isfinite(av->snd.seg2_vol)) av->snd.seg2_vol = 0.5f;
+    /* Sanitize step frequencies/volumes in loaded steps array */
+    for (int si = 0; si < av->snd.step_count; si++) {
+        SndStep *st = &av->snd.steps[si];
+        if (!isfinite(st->freq) || st->freq < 0.0f) st->freq = 0.0f;
+        if (!isfinite(st->volume)) st->volume = 0.0f;
+        if (st->volume < 0.0f) st->volume = 0.0f;
+        if (st->volume > 2.0f) st->volume = 1.0f;
+        if (st->dur_ms < 0) st->dur_ms = 1;
+    }
 
     cop411_update_ctrl_vol(&av->snd);
     /* v15: full COP411L state is now restored from savestate.
@@ -2547,9 +2604,25 @@ static void audio_cb(void *ud, uint8_t *stream, int len) {
  * intensity, deep crimson when fading. */
 static uint32_t framebuf[WIN_W * WIN_H];
 
+/* Gamma lookup table: maps [0..255] intensity to gamma-corrected value.
+ * Rebuilt when gamma setting changes. Eliminates powf() from render loop. */
+static float gamma_lut[256];
+static float gamma_lut_val = -1.0f;  /* current gamma, -1 = not initialized */
+
+static void rebuild_gamma_lut(float gamma) {
+    if (gamma == gamma_lut_val) return;
+    gamma_lut_val = gamma;
+    for (int i = 0; i < 256; i++) {
+        float I = (float)i / 255.0f;
+        gamma_lut[i] = (gamma != 1.0f) ? powf(I, gamma) : I;
+    }
+}
+
 static void render(SDL_Renderer *rr, AV *av) {
     const AVDisp *d = &av->disp;
-    float gamma = av->cfg_gamma;
+
+    /* Rebuild gamma LUT if setting changed */
+    rebuild_gamma_lut(av->cfg_gamma);
 
     /* Count lit pixels for stats */
     int lit = 0;
@@ -2559,12 +2632,14 @@ static void render(SDL_Renderer *rr, AV *av) {
 
     for (int y = 0; y < SH; y++) {
         for (int x = 0; x < SW; x++) {
-            float I = disp_px(d, x, y);
+            float I = d->phosphor[x + y * SW];
             if (I < 0.01f) continue;
             lit++;
 
-            /* Apply gamma curve */
-            float Ig = (gamma != 1.0f) ? powf(I, gamma) : I;
+            /* Apply gamma via LUT (quantize to 8-bit, lookup) */
+            int idx = (int)(I * 255.0f);
+            if (idx > 255) idx = 255;
+            float Ig = gamma_lut[idx];
 
             /* LED red color: warm at high intensity, deep crimson at low. */
             uint8_t r = (uint8_t)(Ig * 255.0f);
@@ -2585,21 +2660,43 @@ static void render(SDL_Renderer *rr, AV *av) {
     }
 
     /* Upload framebuffer to texture and render */
-    static SDL_Texture *tex = NULL;
-    if (!tex) {
-        tex = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGB888,
+    static SDL_Texture *game_tex = NULL;
+    static SDL_Renderer *game_tex_rr = NULL;  /* track renderer for invalidation */
+    if (!game_tex || game_tex_rr != rr) {
+        if (game_tex) SDL_DestroyTexture(game_tex);
+        game_tex = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGB888,
                                 SDL_TEXTUREACCESS_STREAMING, WIN_W, WIN_H);
-        if (!tex) {
+        game_tex_rr = rr;
+        if (!game_tex) {
             fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
             return;
         }
     }
-    SDL_UpdateTexture(tex, NULL, framebuf, WIN_W * sizeof(uint32_t));
+    SDL_UpdateTexture(game_tex, NULL, framebuf, WIN_W * sizeof(uint32_t));
 
     /* Clear full window (wipes any menu remnants from letterbox areas) */
     SDL_SetRenderDrawColor(rr, 0, 0, 0, 255);
     SDL_RenderClear(rr);
-    SDL_RenderCopy(rr, tex, NULL, NULL);
+
+    if (av->integer_scale) {
+        /* Integer scaling: temporarily bypass logical size to compute
+         * integer multiples in actual output pixels, then letterbox. */
+        int ow, oh;
+        SDL_RenderSetLogicalSize(rr, 0, 0);  /* native coords */
+        SDL_GetRendererOutputSize(rr, &ow, &oh);
+        if (ow < 1) ow = 1;
+        if (oh < 1) oh = 1;
+        int sx = ow / WIN_W;
+        int sy = oh / WIN_H;
+        int s = (sx < sy) ? sx : sy;
+        if (s < 1) s = 1;
+        int dw = WIN_W * s, dh = WIN_H * s;
+        SDL_Rect dst = { (ow - dw) / 2, (oh - dh) / 2, dw, dh };
+        SDL_RenderCopy(rr, game_tex, NULL, &dst);
+        SDL_RenderSetLogicalSize(rr, WIN_W, WIN_H);  /* restore */
+    } else {
+        SDL_RenderCopy(rr, game_tex, NULL, NULL);
+    }
 
     /* Scanline effect: darken every other LED row */
     if (av->scanlines) {
@@ -2679,6 +2776,7 @@ int main(int argc, char **argv) {
     bool opt_fullscreen = false;
     bool opt_no_sound = false;
     int opt_scale = 0;
+    int opt_volume = -1;  /* -1 = not set */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fullscreen") == 0) opt_fullscreen = true;
         else if (strcmp(argv[i], "--no-sound") == 0) opt_no_sound = true;
@@ -2689,7 +2787,7 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--volume") == 0 && i+1 < argc) {
             char *end; long lv = strtol(argv[++i], &end, 10);
-            if (*end == '\0' && lv >= 0 && lv <= 10) av.snd_volume = (int)lv;
+            if (*end == '\0' && lv >= 0 && lv <= 10) opt_volume = (int)lv;
             else fprintf(stderr, "Invalid --volume value, ignoring\n");
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -2715,6 +2813,7 @@ int main(int argc, char **argv) {
     config_load(&av, &cfg_fs);
     if (opt_fullscreen) cfg_fs = true;
     if (opt_scale) av.cfg_scale = opt_scale;
+    if (opt_volume >= 0) av.snd_volume = opt_volume;  /* CLI overrides config */
     av.cfg_no_sound = opt_no_sound;
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
@@ -3148,7 +3247,7 @@ int main(int argc, char **argv) {
             render(rr, &av);
 
             /* Flush WAV ring buffer to disk (main thread only) */
-            if (av.wav.active) wav_flush(&av.wav);
+            if (av.wav.fp) wav_flush(&av.wav);
 
             /* Frame timing + FPS measurement */
             {
