@@ -936,12 +936,19 @@ static void disp_latch_led_column(AVDisp *d) {
 }
 
 /* Update display from captured column data (called at end of frame)
- * Simulates POV persistence: existing pixel brightness decays each frame,
- * then newly lit pixels are set to full brightness. */
+ * Simulates POV persistence with non-linear decay: bright pixels fade
+ * fast initially, then linger at low brightness (real LED afterimage).
+ * Formula: new = old * decay^(1 + old*0.5)  — brightness-dependent. */
 static void disp_update(AVDisp *d, float decay) {
-    /* Decay existing phosphor (POV persistence fading) */
+    /* Non-linear phosphor decay */
     for (int i = 0; i < SW * SH; i++) {
-        d->phosphor[i] *= decay;
+        float p = d->phosphor[i];
+        if (p < 0.01f) { d->phosphor[i] = 0.0f; continue; }
+        /* Bright pixels decay faster (exponent increases with brightness).
+         * At p=1.0: decay^1.5, at p=0.1: decay^1.05. This gives a
+         * lingering tail that looks like real LED phosphor afterglow. */
+        float exp = 1.0f + p * 0.5f;
+        d->phosphor[i] = p * powf(decay, exp);
         if (d->phosphor[i] < 0.01f) d->phosphor[i] = 0.0f;
     }
 
@@ -1022,8 +1029,14 @@ struct AV {
     int  rewind_count;       /* number of valid snapshots */
     /* WAV recording */
     WavWriter wav;
-    /* Audio low-pass filter state */
-    float lp_prev;
+    /* Audio low-pass filter state (biquad: 2-pole for realistic speaker response) */
+    float bq_x1, bq_x2;  /* input history */
+    float bq_y1, bq_y2;  /* output history */
+    float bq_b0, bq_b1, bq_b2, bq_a1, bq_a2;  /* biquad coefficients */
+    int   bq_prof;        /* profile for which coefficients were computed */
+    /* RC oscillator jitter (COP411L ±15% clock variation) */
+    float rc_jitter;      /* current pitch multiplier (0.85 - 1.15) */
+    float rc_drift;       /* slow random walk velocity */
     /* Config */
     int  cfg_scale;          /* window scale factor (0=auto) */
     bool cfg_no_sound;
@@ -1034,8 +1047,13 @@ struct AV {
     float cfg_phosphor;      /* phosphor decay (default 0.45) */
     bool  scanlines;         /* scanline overlay effect */
     bool  integer_scale;     /* force integer scaling */
+    bool  led_glow;          /* LED bloom/glow effect */
+    bool  led_vignette;      /* mirror vignette darkening */
+    bool  led_round;         /* round LED dots (vs square) */
+    bool  mirror_warp;       /* barrel distortion from curved mirror */
     bool  show_stats;        /* FPS/cycles overlay */
     bool  midframe_scan;     /* mid-frame column capture mode */
+    bool  led_pipeline;      /* cycle-accurate P2.4 strobe capture */
     /* v15: configurable timing */
     int   t1_pulse_start;
     int   t1_pulse_end;
@@ -1067,8 +1085,23 @@ static void av_port_write(AV *av, uint8_t port, uint8_t val) {
     case 0: av->cpu.BUS = val; break;
     case 1: break;
     case 2:
-        /* P2.4 strobe detection disabled — using XRAM direct capture.
-         * LED register pipeline kept in code for reference (§4.3). */
+        /* LED pipeline v2: on P2.4 rising edge, compute display column
+         * directly from CPU register state (R0 + bank from P1) and
+         * snapshot XRAM at that exact cycle. This is more accurate than
+         * end-of-frame capture for games that modify VRAM mid-display.
+         *
+         * BIOS display routine: R0 points to 5th byte of column at strobe.
+         * Column = (bank-1)*50 + (R0-10)/5 where bank = P1 & 3. */
+        if (av->led_pipeline &&
+            (val & 0x10) && !(av->prev_p2 & 0x10)) {
+            uint8_t bank = av->cpu.P1 & 3;
+            uint8_t r0 = av->cpu.iram[(av->cpu.BS ? 24 : 0)]; /* R0 */
+            if (bank >= 1 && bank <= 3 && r0 >= 10) {
+                int col = (int)(bank - 1) * 50 + (int)(r0 - 10) / 5;
+                if (col >= 0 && col < SW)
+                    disp_capture_column(&av->disp, av->cpu.xram, col);
+            }
+        }
         av->prev_p2 = val;
 
         /* COP411L sound command protocol:
@@ -1161,10 +1194,19 @@ static void av_init(AV *av) {
     av->t1_pulse_end = DEF_T1_END;
     av->prev_p2 = 0;
     av->cpu.ei_delay = 0;
+    /* Audio filter state: will be computed on first audio callback */
+    av->bq_prof = -1;  /* force coefficient recompute */
+    av->rc_jitter = 1.0f;
+    av->rc_drift = 0.0f;
     memset(av->disp.led_reg, 0xFF, sizeof(av->disp.led_reg));
     av->disp.led_col = 0;
     av->disp.led_active = false;
     av->midframe_scan = true;  /* Default: accurate mid-frame column capture */
+    av->led_glow = true;       /* Default: LED bloom enabled */
+    av->led_vignette = true;   /* Default: mirror vignette enabled */
+    av->led_round = true;      /* Default: round LED dots */
+    av->mirror_warp = true;    /* Default: barrel distortion enabled */
+    av->led_pipeline = false;  /* Default: off (XRAM direct capture) */
     av->dbg_run_to = 0xFFFF;
     av->dbg_watch_addr = 0xFFFF;
     /* Rewind buffer: allocate on first init, reuse afterwards */
@@ -1385,6 +1427,11 @@ static void config_save(const AV *av, bool fullscreen) {
     fprintf(f, "phosphor=%.2f\n", av->cfg_phosphor);
     fprintf(f, "scanlines=%d\n", av->scanlines ? 1 : 0);
     fprintf(f, "integer_scale=%d\n", av->integer_scale ? 1 : 0);
+    fprintf(f, "led_glow=%d\n", av->led_glow ? 1 : 0);
+    fprintf(f, "led_vignette=%d\n", av->led_vignette ? 1 : 0);
+    fprintf(f, "led_round=%d\n", av->led_round ? 1 : 0);
+    fprintf(f, "mirror_warp=%d\n", av->mirror_warp ? 1 : 0);
+    fprintf(f, "led_pipeline=%d\n", av->led_pipeline ? 1 : 0);
     fprintf(f, "# Timing (advanced)\n");
     fprintf(f, "t1_pulse_start=%d\n", av->t1_pulse_start);
     fprintf(f, "t1_pulse_end=%d\n", av->t1_pulse_end);
@@ -1413,6 +1460,16 @@ static void config_load(AV *av, bool *fullscreen) {
             av->scanlines = (v != 0);
         if (sscanf(line, "integer_scale=%d", &v) == 1)
             av->integer_scale = (v != 0);
+        if (sscanf(line, "led_glow=%d", &v) == 1)
+            av->led_glow = (v != 0);
+        if (sscanf(line, "led_vignette=%d", &v) == 1)
+            av->led_vignette = (v != 0);
+        if (sscanf(line, "led_round=%d", &v) == 1)
+            av->led_round = (v != 0);
+        if (sscanf(line, "mirror_warp=%d", &v) == 1)
+            av->mirror_warp = (v != 0);
+        if (sscanf(line, "led_pipeline=%d", &v) == 1)
+            av->led_pipeline = (v != 0);
         if (sscanf(line, "t1_pulse_start=%d", &v) == 1 && v >= 0 && v < 1000)
             av->t1_pulse_start = v;
         if (sscanf(line, "t1_pulse_end=%d", &v) == 1 && v >= 0 && v < 2000)
@@ -1867,13 +1924,14 @@ static int run_self_test(void) {
         else { fail++; printf("FAIL: noise cmd\n"); }
     }
 
-    /* Test 10: Phosphor persistence */
+    /* Test 10: Phosphor persistence (non-linear: decay^(1+p*0.5))
+     * At p=1.0, decay=0.45: result = 0.45^1.5 ≈ 0.302 */
     {
         AVDisp d; memset(&d, 0, sizeof(d));
         d.phosphor[0] = 1.0f;
         disp_update(&d, 0.45f); /* decay */
-        if (d.phosphor[0] > 0.44f && d.phosphor[0] < 0.46f) pass++;
-        else { fail++; printf("FAIL: phosphor decay=%.3f\n", d.phosphor[0]); }
+        if (d.phosphor[0] > 0.29f && d.phosphor[0] < 0.31f) pass++;
+        else { fail++; printf("FAIL: phosphor decay=%.3f (expected ~0.302)\n", d.phosphor[0]); }
     }
 
     /* Test 11: Savestate round-trip */
@@ -2834,24 +2892,101 @@ menu_exit_quit:
 }
 
 /* ---- Audio callback — generates samples from COP411L engine ---- */
+
+/* Compute biquad low-pass coefficients (peaking LP for speaker resonance).
+ * Type: 2nd-order Butterworth LP with optional resonance boost. */
+static void biquad_lp_compute(AV *av, float cutoff_hz, float Q) {
+    float w0 = 2.0f * 3.14159265f * cutoff_hz / (float)AUDIO_RATE;
+    float sinw = sinf(w0), cosw = cosf(w0);
+    float alpha = sinw / (2.0f * Q);
+    float a0 = 1.0f + alpha;
+    av->bq_b0 = ((1.0f - cosw) / 2.0f) / a0;
+    av->bq_b1 = (1.0f - cosw) / a0;
+    av->bq_b2 = av->bq_b0;
+    av->bq_a1 = (-2.0f * cosw) / a0;
+    av->bq_a2 = (1.0f - alpha) / a0;
+}
+
+/* Simple xorshift32 PRNG for RC jitter (fast, no state beyond one uint32) */
+static uint32_t audio_rng_state = 0xDEADBEEF;
+static float audio_randf(void) {
+    audio_rng_state ^= audio_rng_state << 13;
+    audio_rng_state ^= audio_rng_state >> 17;
+    audio_rng_state ^= audio_rng_state << 5;
+    return (float)(audio_rng_state & 0xFFFF) / 65535.0f; /* 0.0 - 1.0 */
+}
+
 static void audio_cb(void *ud, uint8_t *stream, int len) {
     AV *av = (AV *)ud;
     int16_t *out = (int16_t *)stream;
     int n = len / (int)sizeof(int16_t);
     int vol = av->snd_volume;
     int amplitude = 300 * vol;  /* max 3000 at vol=10 */
-    float prev = av->lp_prev;
     int prof = av->audio_profile;
-    float alpha = (prof >= 0 && prof < AUDIO_PROFILES) ? audio_lp_alpha[prof] : 1.0f;
+
+    /* Recompute biquad coefficients when profile changes */
+    if (prof != av->bq_prof) {
+        av->bq_prof = prof;
+        av->bq_x1 = av->bq_x2 = av->bq_y1 = av->bq_y2 = 0.0f;
+        switch (prof) {
+        case AUDIO_SPEAKER:
+            /* Small speaker: LP ~3.5kHz with slight resonance (Q=0.9).
+             * Simulates the tiny AV internal speaker's bandwidth. */
+            biquad_lp_compute(av, 3500.0f, 0.9f);
+            break;
+        case AUDIO_HEADPHONE:
+            /* Headphone: gentle LP ~8kHz, flat response (Q=0.707 = Butterworth) */
+            biquad_lp_compute(av, 8000.0f, 0.707f);
+            break;
+        default: /* RAW: passthrough (b0=1, rest=0) */
+            av->bq_b0 = 1.0f; av->bq_b1 = av->bq_b2 = 0.0f;
+            av->bq_a1 = av->bq_a2 = 0.0f;
+            break;
+        }
+    }
+
+    /* RC oscillator jitter: slow random walk simulating ±5% drift.
+     * Real hardware varies ±15%, we use a subtler effect for playability.
+     * Drift is per-buffer (~11ms chunks) for a slow, organic wobble. */
+    if (prof == AUDIO_SPEAKER) {
+        av->rc_drift += (audio_randf() - 0.5f) * 0.002f;
+        /* Dampen drift back toward center */
+        av->rc_drift *= 0.98f;
+        av->rc_jitter += av->rc_drift;
+        /* Clamp to ±5% */
+        if (av->rc_jitter > 1.05f) { av->rc_jitter = 1.05f; av->rc_drift = -fabsf(av->rc_drift); }
+        if (av->rc_jitter < 0.95f) { av->rc_jitter = 0.95f; av->rc_drift = fabsf(av->rc_drift); }
+    } else {
+        av->rc_jitter = 1.0f;
+    }
+
+    float x1 = av->bq_x1, x2 = av->bq_x2;
+    float y1 = av->bq_y1, y2 = av->bq_y2;
+    float b0 = av->bq_b0, b1 = av->bq_b1, b2 = av->bq_b2;
+    float a1 = av->bq_a1, a2 = av->bq_a2;
+    float jitter = av->rc_jitter;
+
     for (int i = 0; i < n; i++) {
+        /* Apply RC jitter: temporarily scale phase_inc */
+        uint32_t orig_inc = av->snd.phase_inc;
+        if (jitter != 1.0f)
+            av->snd.phase_inc = (uint32_t)((float)orig_inc * jitter);
         float s = cop411_sample(&av->snd);
-        /* Audio filter: profile-dependent low-pass */
-        prev += alpha * (s - prev);
-        float fout = prev;
+        av->snd.phase_inc = orig_inc;  /* restore */
+
+        /* Biquad filter: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2]
+         *                     - a1*y[n-1] - a2*y[n-2] */
+        float y = b0*s + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2 = x1; x1 = s;
+        y2 = y1; y1 = y;
+
+        float fout = y;
+
         /* Soft clip for speaker profile (simulates small speaker distortion) */
         if (prof == AUDIO_SPEAKER && (fout > 0.8f || fout < -0.8f))
             fout = fout > 0 ? 0.8f + 0.2f * tanhf((fout-0.8f)*5.0f)
                             : -0.8f + 0.2f * tanhf((fout+0.8f)*5.0f);
+
         int16_t sample = (int16_t)(fout * (float)amplitude);
         out[i] = sample;
         /* Enqueue to WAV ring buffer (lock-free: single writer) */
@@ -2861,7 +2996,8 @@ static void audio_cb(void *ud, uint8_t *stream, int len) {
             av->wav.ring_wr = wi + 1;
         }
     }
-    av->lp_prev = prev;
+    av->bq_x1 = x1; av->bq_x2 = x2;
+    av->bq_y1 = y1; av->bq_y2 = y2;
 }
 
 /* ---- Render: faithful red LED POV display ----
@@ -2895,8 +3031,79 @@ static void render(SDL_Renderer *rr, AV *av) {
     /* Count lit pixels for stats */
     int lit = 0;
 
-    /* Render LED display into framebuffer */
+    /* Render LED display into framebuffer with glow/bloom effect.
+     * Real AV LEDs bleed light through the red filter, creating a soft
+     * halo around each lit dot. We render in two passes:
+     * 1. Sharp LED dots (full intensity)
+     * 2. Additive glow pass (soft bloom around lit pixels) */
     memset(framebuf, 0, sizeof(framebuf)); /* black background */
+
+    /* Precompute vignette darkening LUT (simulates mirror viewing angle).
+     * Center of screen is full brightness, edges darken slightly. */
+    static float vignette[SW * SH];
+    static bool vignette_init = false;
+    if (!vignette_init) {
+        float cx = (float)SW * 0.5f, cy = (float)SH * 0.5f;
+        float max_r = sqrtf(cx*cx + cy*cy);
+        for (int y = 0; y < SH; y++) {
+            for (int x = 0; x < SW; x++) {
+                float dx = (float)x - cx, dy = (float)y - cy;
+                float r = sqrtf(dx*dx + dy*dy) / max_r;
+                /* Subtle vignette: 1.0 at center, ~0.82 at corners */
+                vignette[x + y * SW] = 1.0f - 0.18f * r * r;
+            }
+        }
+        vignette_init = true;
+    }
+
+    /* Precompute mirror barrel distortion warp table.
+     * The AV uses a rotating concave mirror that introduces slight barrel
+     * distortion: columns near the edges are compressed horizontally.
+     * warp_x[x] maps logical column x to a sub-pixel output x position. */
+    static float warp_x[SW];
+    static bool warp_init = false;
+    if (!warp_init) {
+        float half = (float)SW * 0.5f;
+        float k = 0.08f;  /* barrel distortion coefficient (subtle) */
+        for (int x = 0; x < SW; x++) {
+            float u = ((float)x - half) / half;  /* -1..+1 */
+            float u2 = u * u;
+            float warped = u * (1.0f + k * u2); /* barrel: expand center, compress edges */
+            warp_x[x] = half + warped * half;
+        }
+        warp_init = true;
+    }
+
+    /* Precompute round LED dot mask (SCALE×SCALE alpha values).
+     * Real AV LEDs produce round dots, not squares. */
+    static float led_mask[SCALE * SCALE];
+    static bool mask_init = false;
+    if (!mask_init) {
+        float cx = ((float)LED_SIZE - 1.0f) * 0.5f;
+        float cy = cx;
+        float r_sq = (cx + 0.5f) * (cx + 0.5f);
+        for (int dy = 0; dy < SCALE; dy++) {
+            for (int dx = 0; dx < SCALE; dx++) {
+                if (dx >= LED_SIZE || dy >= LED_SIZE) {
+                    led_mask[dy * SCALE + dx] = 0.0f;  /* gap */
+                    continue;
+                }
+                float fx = (float)dx - cx, fy = (float)dy - cy;
+                float d_sq = fx*fx + fy*fy;
+                if (d_sq <= r_sq * 0.5f)
+                    led_mask[dy * SCALE + dx] = 1.0f;
+                else if (d_sq <= r_sq)
+                    led_mask[dy * SCALE + dx] = 1.0f - (d_sq - r_sq*0.5f) / (r_sq*0.5f);
+                else
+                    led_mask[dy * SCALE + dx] = 0.0f;
+            }
+        }
+        mask_init = true;
+    }
+
+    /* Pass 1: sharp LED dots + accumulate glow source */
+    static float glow_src[SW * SH]; /* intensity at LED resolution */
+    memset(glow_src, 0, sizeof(glow_src));
 
     for (int y = 0; y < SH; y++) {
         for (int x = 0; x < SW; x++) {
@@ -2904,25 +3111,97 @@ static void render(SDL_Renderer *rr, AV *av) {
             if (I < 0.01f) continue;
             lit++;
 
-            /* Apply gamma via LUT (quantize to 8-bit, lookup) */
+            /* Apply vignette */
+            if (av->led_vignette) I *= vignette[x + y * SW];
+
+            /* Apply gamma via LUT */
             int idx = (int)(I * 255.0f);
             if (idx > 255) idx = 255;
             float Ig = gamma_lut[idx];
 
-            /* LED red color: warm at high intensity, deep crimson at low. */
-            uint8_t r = (uint8_t)(Ig * 255.0f);
-            uint8_t g = (uint8_t)(Ig * Ig * 25.0f);
-            uint8_t b = (uint8_t)(Ig * Ig * Ig * 6.0f);
-            uint32_t col = (r << 16) | (g << 8) | b;
+            glow_src[x + y * SW] = Ig;
 
-            /* Fill sharp LED_SIZE×LED_SIZE dot within SCALE×SCALE cell.
-             * The 1px black gap on right/bottom edge simulates the physical
-             * spacing between discrete LEDs and mirror column positions. */
+            /* LED red color: warm at high intensity, orange tint, deep crimson at low. */
+            uint8_t r = (uint8_t)(Ig * 255.0f);
+            uint8_t g = (uint8_t)(Ig * Ig * 30.0f);  /* slightly more orange */
+            uint8_t b = (uint8_t)(Ig * Ig * Ig * 6.0f);
+
+            /* Compute output X (with optional barrel distortion from curved mirror) */
+            int bx, by;
+            if (av->mirror_warp) {
+                bx = (int)(warp_x[x] * (float)SCALE);
+                if (bx < 0) bx = 0;
+                if (bx + SCALE > WIN_W) bx = WIN_W - SCALE;
+            } else {
+                bx = x * SCALE;
+            }
+            by = y * SCALE;
+
+            /* Fill LED dot: round (anti-aliased disk) or sharp square */
+            if (av->led_round) {
+                for (int dy = 0; dy < SCALE; dy++) {
+                    if (by + dy >= WIN_H) break;
+                    uint32_t *row = &framebuf[(by + dy) * WIN_W + bx];
+                    for (int dx = 0; dx < SCALE; dx++) {
+                        if (bx + dx >= WIN_W) break;
+                        float a = led_mask[dy * SCALE + dx];
+                        if (a < 0.01f) continue;
+                        row[dx] = ((uint8_t)(r*a)<<16)|((uint8_t)(g*a)<<8)|(uint8_t)(b*a);
+                    }
+                }
+            } else {
+                uint32_t col = (r << 16) | (g << 8) | b;
+                for (int dy = 0; dy < LED_SIZE; dy++) {
+                    if (by + dy >= WIN_H) break;
+                    uint32_t *row = &framebuf[(by + dy) * WIN_W + bx];
+                    for (int dx = 0; dx < LED_SIZE; dx++)
+                        row[dx] = col;
+                }
+            }
+        }
+    }
+
+    /* Pass 2: LED glow/bloom — additive soft halo (toggle: 'g' key).
+     * Simple 3×3 box blur on glow_src at LED resolution, then add
+     * as a dim wide halo filling the full SCALE×SCALE cell. */
+    if (av->led_glow)
+    for (int y = 0; y < SH; y++) {
+        for (int x = 0; x < SW; x++) {
+            /* Sum 3×3 neighbors for bloom intensity */
+            float bloom = 0.0f;
+            for (int ny = y-1; ny <= y+1; ny++) {
+                if ((unsigned)ny >= (unsigned)SH) continue;
+                for (int nx = x-1; nx <= x+1; nx++) {
+                    if ((unsigned)nx >= (unsigned)SW) continue;
+                    bloom += glow_src[nx + ny * SW];
+                }
+            }
+            bloom *= (1.0f / 9.0f) * 0.25f;  /* 25% of average neighbor intensity */
+            if (bloom < 0.005f) continue;
+
+            /* Bloom color: very dim red-orange */
+            uint8_t br = (uint8_t)(bloom * 90.0f);  /* dimmer than main dot */
+            uint8_t bg = (uint8_t)(bloom * bloom * 8.0f);
+            uint32_t bcol = (br << 16) | (bg << 8);
+            if (bcol == 0) continue;
+
+            /* Additive blend into the full SCALE×SCALE cell (including gap) */
             int bx = x * SCALE, by = y * SCALE;
-            for (int dy = 0; dy < LED_SIZE; dy++) {
-                uint32_t *row = &framebuf[(by + dy) * WIN_W + bx];
-                for (int dx = 0; dx < LED_SIZE; dx++)
-                    row[dx] = col;
+            for (int dy = 0; dy < SCALE; dy++) {
+                int py = by + dy;
+                if (py >= WIN_H) break;
+                uint32_t *row = &framebuf[py * WIN_W + bx];
+                for (int dx = 0; dx < SCALE; dx++) {
+                    if (bx + dx >= WIN_W) break;
+                    uint32_t existing = row[dx];
+                    /* Additive blend (saturate at 255) */
+                    uint32_t er = (existing >> 16) & 0xFF;
+                    uint32_t eg = (existing >> 8) & 0xFF;
+                    uint32_t eb = existing & 0xFF;
+                    er += br; if (er > 255) er = 255;
+                    eg += bg; if (eg > 255) eg = 255;
+                    row[dx] = (er << 16) | (eg << 8) | eb;
+                }
             }
         }
     }
@@ -3178,6 +3457,11 @@ int main(int argc, char **argv) {
             bool          p_intscale   = av.integer_scale;
             bool          p_stats      = av.show_stats;
             bool          p_midframe   = av.midframe_scan;
+            bool          p_led_pipe   = av.led_pipeline;
+            bool          p_led_round  = av.led_round;
+            bool          p_mirror_warp= av.mirror_warp;
+            bool          p_led_glow   = av.led_glow;
+            bool          p_led_vign   = av.led_vignette;
             int           p_t1start    = av.t1_pulse_start;
             int           p_t1end      = av.t1_pulse_end;
             /* Reset core state */
@@ -3197,7 +3481,9 @@ int main(int argc, char **argv) {
             av.dbg_run_to = 0xFFFF;
             av.dbg_watch_addr = 0xFFFF;
             av.dbg_watch_en = false;
-            av.lp_prev = 0;
+            av.bq_x1 = av.bq_x2 = av.bq_y1 = av.bq_y2 = 0.0f;
+            av.bq_prof = -1;  /* force recompute */
+            av.rc_jitter = 1.0f; av.rc_drift = 0.0f;
             /* Init CPU */
             av.cpu.P1 = 0xFB;
             av.cpu.P2 = 0xFF;
@@ -3223,6 +3509,11 @@ int main(int argc, char **argv) {
             av.integer_scale = p_intscale;
             av.show_stats    = p_stats;
             av.midframe_scan = p_midframe;
+            av.led_pipeline  = p_led_pipe;
+            av.led_round     = p_led_round;
+            av.mirror_warp   = p_mirror_warp;
+            av.led_glow      = p_led_glow;
+            av.led_vignette  = p_led_vign;
             av.t1_pulse_start= p_t1start;
             av.t1_pulse_end  = p_t1end;
         }
@@ -3376,8 +3667,8 @@ int main(int argc, char **argv) {
                         break;
                     case SDLK_F3:
                         if(p) {
-                            av.midframe_scan = !av.midframe_scan;
-                            osd_show(&av, av.midframe_scan ? "Mid-frame scan ON" : "Mid-frame scan OFF");
+                            av.led_pipeline = !av.led_pipeline;
+                            osd_show(&av, av.led_pipeline ? "LED pipeline ON" : "LED pipeline OFF");
                         }
                         break;
                     case SDLK_F4:
@@ -3448,6 +3739,30 @@ int main(int argc, char **argv) {
                         break;
                     case SDLK_F12:
                         if(p) { screenshot_bmp(rr); osd_show(&av, "Screenshot saved"); }
+                        break;
+                    case SDLK_g:
+                        if(p) {
+                            av.led_glow = !av.led_glow;
+                            osd_show(&av, av.led_glow ? "LED Glow ON" : "LED Glow OFF");
+                        }
+                        break;
+                    case SDLK_v:
+                        if(p) {
+                            av.led_vignette = !av.led_vignette;
+                            osd_show(&av, av.led_vignette ? "Vignette ON" : "Vignette OFF");
+                        }
+                        break;
+                    case SDLK_o:
+                        if(p) {
+                            av.led_round = !av.led_round;
+                            osd_show(&av, av.led_round ? "Round LEDs ON" : "Square LEDs");
+                        }
+                        break;
+                    case SDLK_m:
+                        if(p) {
+                            av.mirror_warp = !av.mirror_warp;
+                            osd_show(&av, av.mirror_warp ? "Mirror warp ON" : "Mirror warp OFF");
+                        }
                         break;
                     default: break;
                     } break;
